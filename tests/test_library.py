@@ -12,6 +12,7 @@ from app.upnp import Network, parse_didl
 SERVER = {"id": "uuid:server", "name": "MiniDLNA", "kind": "server", "location": "http://localhost/description.xml", "model": "test"}
 RENDERER = {**SERVER, "id": "uuid:tv", "kind": "renderer", "name": "TV"}
 HEADERS = {"X-Requested-With": "dlna-library"}
+LOCAL = {"base_url": "http://localhost", "client": ("127.0.0.1", 50000)}
 XML = '''<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
 <item id="a" parentID="0" restricted="1"><dc:title>20240102123456.mp4</dc:title><dc:date>2024-01-02</dc:date><upnp:album>2024-01 家族旅行</upnp:album><upnp:class>object.item.videoItem</upnp:class><res protocolInfo="http-get:*:video/mp4:*" duration="00:00:20" size="100" resolution="1920x1080">http://localhost/video.mp4?a=1&amp;b=2</res><res protocolInfo="http-get:*:video/vnd.dlna.mpeg-tts:*">http://localhost/video.m2ts</res></item></DIDL-Lite>'''
 
@@ -92,9 +93,12 @@ def test_api_title_and_device_control(tmp_path):
     db.device(SERVER)
     db.device(RENDERER)
     id = db.upsert(SERVER["id"], item())
-    with TestClient(app) as client:
+    with TestClient(app, **LOCAL) as client:
         assert client.patch(f"/api/media/{id}/title", json={"title": "x"}).status_code == 403
         assert client.patch(f"/api/media/{id}/title", headers={**HEADERS, "Origin": "http://evil.example"}, json={"title": "x"}).status_code == 403
+        assert client.patch(f"/api/media/{id}/title", headers={**HEADERS, "Origin": "http://localhost:8000"}, json={"title": "x"}).status_code == 403
+        assert client.patch(f"/api/media/{id}/title", headers={**HEADERS, "Origin": "null"}, json={"title": "x"}).status_code == 403
+        assert client.patch(f"/api/media/{id}/title", headers={**HEADERS, "Origin": "http://localhost"}, json={"title": "ok"}).status_code == 200
         response = client.patch(f"/api/media/{id}/title", headers=HEADERS, json={"title": "<img src=x onerror=alert(1)>"})
         assert response.status_code == 200
         rows = client.get("/api/media", params={"server_id": SERVER["id"]}).json()
@@ -110,11 +114,77 @@ def test_api_title_and_device_control(tmp_path):
 
 def test_lan_token(tmp_path, monkeypatch):
     monkeypatch.setenv("DLNA_TOKEN", "secret")
-    with TestClient(create_app(tmp_path)) as client:
+    monkeypatch.setenv("DLNA_ALLOWED_HOSTS", "192.168.1.10, nas-mac.local")
+    with TestClient(create_app(tmp_path), base_url="http://192.168.1.10:8000", client=("192.168.1.20", 50000)) as client:
         assert client.get("/api/devices").status_code == 401
         assert client.post("/api/login", json={"token": "wrong"}).status_code == 401
         assert client.post("/api/login", json={"token": "secret"}).status_code == 200
         assert client.get("/api/devices").status_code == 200
+        assert client.get("/api/devices", headers={"Host": "nas-mac.local:8000"}).status_code == 200
+
+
+def test_host_allowlist_blocks_dns_rebinding(tmp_path, monkeypatch):
+    monkeypatch.delenv("DLNA_ALLOWED_HOSTS", raising=False)
+    monkeypatch.delenv("DLNA_TOKEN", raising=False)
+    with TestClient(create_app(tmp_path), **LOCAL) as client:
+        assert client.get("/api/devices").status_code == 200
+        assert client.get("/api/devices", headers={"Host": "127.0.0.1:8000"}).status_code == 200
+        assert client.get("/api/devices", headers={"Host": "[::1]:8000"}).status_code == 200
+        response = client.get("/api/devices", headers={"Host": "evil.example:8000"})
+        assert response.status_code == 400 and "evil" not in response.text
+        assert client.get("/", headers={"Host": "attacker.localhost.evil.example"}).status_code == 400
+        # Even an Origin matching the (rebound) Host is refused.
+        assert client.post("/api/discover", headers={**HEADERS, "Host": "evil.example", "Origin": "http://evil.example"}).status_code == 400
+        assert client.post("/api/devices", headers={**HEADERS, "Origin": "http://evil.example"}, json={"url": "http://x"}).status_code == 403
+    monkeypatch.setenv("DLNA_ALLOWED_HOSTS", "evil.example")
+    with TestClient(create_app(tmp_path), **LOCAL) as client:
+        assert client.get("/api/devices", headers={"Host": "evil.example"}).status_code == 200
+
+
+def test_lan_client_requires_token(tmp_path, monkeypatch):
+    monkeypatch.delenv("DLNA_TOKEN", raising=False)
+    monkeypatch.setenv("DLNA_ALLOWED_HOSTS", "192.168.1.10")
+    lan = {"base_url": "http://192.168.1.10:8000", "client": ("192.168.1.20", 50000)}
+    with TestClient(create_app(tmp_path), **lan) as client:
+        response = client.get("/api/devices")
+        assert response.status_code == 403 and "DLNA_TOKEN" in response.json()["detail"]
+        assert client.post("/api/devices", headers=HEADERS, json={"url": "http://169.254.169.254/"}).status_code == 403
+    with TestClient(create_app(tmp_path), base_url="http://localhost", client=("::1", 50000)) as client:
+        assert client.get("/api/devices").status_code == 200
+    monkeypatch.setenv("DLNA_TOKEN", "secret")
+    with TestClient(create_app(tmp_path), **lan) as client:
+        assert client.get("/api/devices").status_code == 401
+        assert client.get("/api/devices", headers={"Authorization": "Bearer secret"}).status_code == 200
+
+
+def test_device_errors_are_not_leaked(tmp_path, monkeypatch, caplog):
+    monkeypatch.delenv("DLNA_TOKEN", raising=False)
+    net = Network()
+    net.load = AsyncMock(side_effect=RuntimeError("upstream secret body 10.0.0.5"))
+    with TestClient(create_app(tmp_path, net), **LOCAL) as client:
+        response = client.post("/api/devices", headers=HEADERS, json={"url": "http://10.0.0.5/desc.xml"})
+        assert response.status_code == 502
+        assert response.json()["detail"] == "機器説明を取得できませんでした"
+        assert "secret" not in response.text
+        response = client.post("/api/devices", headers=HEADERS, json={"url": "file:///etc/passwd"})
+        assert response.status_code == 422 and response.json()["detail"] == "機器URLはhttp(s)で指定してください"
+    assert "upstream secret body" in caplog.text
+
+
+def test_unhandled_exception_is_generic(tmp_path, monkeypatch, caplog):
+    monkeypatch.delenv("DLNA_TOKEN", raising=False)
+    net = Network()
+    net.command = AsyncMock(side_effect=RuntimeError("internal detail /Users/x"))
+    app = create_app(tmp_path, net)
+    app.state.catalog.device(RENDERER)
+    with TestClient(app, raise_server_exceptions=False, **LOCAL) as client:
+        response = client.post("/api/renderers/uuid:tv/play", headers=HEADERS)
+        assert response.status_code == 502
+        assert "internal detail" not in response.text and response.json()["detail"]
+        net.command = AsyncMock(side_effect=ValueError("AVTransportサービスがありません"))  # app-authored message stays visible
+        response = client.post("/api/renderers/uuid:tv/pause", headers=HEADERS)
+        assert response.status_code == 422 and response.json()["detail"] == "AVTransportサービスがありません"
+    assert "internal detail" in caplog.text
 
 
 def test_browse_pagination_and_containers():
