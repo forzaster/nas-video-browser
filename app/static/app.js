@@ -119,7 +119,10 @@ $('add').onsubmit=action(async e=>{e.preventDefault();await api('/devices','POST
 // Starting is idempotent on the server: a running crawl is joined, never duplicated or cancelled.
 // Switching servers only changes what is displayed; other crawls keep running in the background.
 async function startCrawl(){const server=$('server').value;const state=await api('/servers/'+enc(server)+'/crawl','POST');if(server===$('server').value){showCrawl(state);scanWasRunning=true;}return state;}
-$('server').onchange=action(async()=>{year=null;album=null;showCrawl(null);await refresh();if($('server').value)await startCrawl();});
+// The last selected MediaServer is remembered per browser (storage may be unavailable, e.g. private mode).
+const savedServer={get(){try{return localStorage.getItem('dlna.server')||'';}catch{return '';}},set(v){try{localStorage.setItem('dlna.server',v);}catch{}}};
+async function selectServer(){year=null;album=null;showCrawl(null);await refresh();if($('server').value)await startCrawl();}
+$('server').onchange=action(async()=>{savedServer.set($('server').value);await selectServer();});
 $('crawl').onclick=action(async()=>{if(!$('server').value)throw new Error('MediaServerを選択してください');await startCrawl();});
 // Admin-only source-folder picker: browse containers, then pin one (or return to auto-detection).
 let rootPath = [], rootVersion = 0;
@@ -160,7 +163,8 @@ $('show-hidden').onchange=action(()=>refresh());
 async function boot(){const me=await api('/me');role=me.role;
   $('role').textContent=isAdmin()?'管理者':'ゲスト';$('role').dataset.role=role;$('account').hidden=false;$('logout').hidden=!me.auth;
   $('show-hidden-wrap').hidden=!isAdmin();$('root-open').hidden=!isAdmin();$('add').closest('details').hidden=!isAdmin();if(!isAdmin())$('show-hidden').checked=false;
-  await devices();await refresh();}
+  await devices();const saved=savedServer.get();
+  if(saved&&!$('server').value&&[...$('server').options].some(o=>o.value===saved)){$('server').value=saved;await selectServer();}else await refresh();}
 const crawlLabels={idle:'待機',scanning:'動画を取得中',thumbnails:'サムネイル生成中',complete:'クロール完了',failed:'クロール失敗',interrupted:'中断'};
 const isRunning=state=>!!state&&['scanning','thumbnails'].includes(state.state);
 function showCrawl(state){const status=$('crawl-status'),button=$('crawl'),running=isRunning(state);
