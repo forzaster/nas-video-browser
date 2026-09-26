@@ -18,6 +18,11 @@ def display_title(title):
     return stem
 
 
+# Own flag, or the item's year (album '') or year+album is hidden.
+SELECT = """SELECT *, (hidden OR EXISTS(SELECT 1 FROM hidden_groups g WHERE g.server_id=media.server_id
+    AND g.year=media.year AND g.album IN ('', media.album))) AS hidden_effective FROM media"""
+
+
 def year_for(album, date, title):
     for value in (album, date, title):
         match = re.match(r"((?:19|20)\d{2})", value or "")
@@ -38,7 +43,8 @@ class Catalog:
                 PRAGMA journal_mode=WAL;
                 CREATE TABLE IF NOT EXISTS devices (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, location TEXT NOT NULL,
-                    kind TEXT NOT NULL, model TEXT, seen TEXT DEFAULT CURRENT_TIMESTAMP
+                    kind TEXT NOT NULL, model TEXT, seen TEXT DEFAULT CURRENT_TIMESTAMP,
+                    crawl_root TEXT, crawl_root_title TEXT  -- NULL = auto-detect at each crawl
                 );
                 CREATE TABLE IF NOT EXISTS media (
                     id TEXT PRIMARY KEY, server_id TEXT NOT NULL, object_id TEXT NOT NULL,
@@ -46,12 +52,22 @@ class Catalog:
                     album TEXT NOT NULL, year TEXT NOT NULL, date TEXT,
                     resources TEXT NOT NULL, metadata TEXT NOT NULL,
                     fingerprint TEXT NOT NULL, thumbnail TEXT, thumb_error TEXT,
-                    available INTEGER NOT NULL DEFAULT 1,
+                    available INTEGER NOT NULL DEFAULT 1, hidden INTEGER NOT NULL DEFAULT 0,
                     updated TEXT DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(server_id, object_id)
                 );
                 CREATE INDEX IF NOT EXISTS media_group ON media(server_id, available, year, album);
+                CREATE TABLE IF NOT EXISTS hidden_groups (  -- album '' hides the whole year
+                    server_id TEXT NOT NULL, year TEXT NOT NULL, album TEXT NOT NULL,
+                    PRIMARY KEY(server_id, year, album)
+                );
             """)
+            if "hidden" not in {r["name"] for r in db.execute("PRAGMA table_info(media)")}:
+                db.execute("ALTER TABLE media ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+            columns = {r["name"] for r in db.execute("PRAGMA table_info(devices)")}
+            for name in ("crawl_root", "crawl_root_title"):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE devices ADD COLUMN {name} TEXT")
 
     @contextmanager
     def connect(self):
@@ -68,6 +84,12 @@ class Catalog:
             db.execute("""INSERT INTO devices(id,name,location,kind,model) VALUES(:id,:name,:location,:kind,:model)
                 ON CONFLICT(id) DO UPDATE SET name=excluded.name,location=excluded.location,
                 kind=excluded.kind,model=excluded.model,seen=CURRENT_TIMESTAMP""", device)
+
+    def crawl_root(self, id, root, title=None):
+        """Admin-chosen crawl root; root None resets to auto. Discovery upserts never touch these columns."""
+        with self.connect() as db:
+            db.execute("UPDATE devices SET crawl_root=?,crawl_root_title=? WHERE id=?",
+                       (root, (title or root) if root else None, id))
 
     def devices(self):
         with self.connect() as db:
@@ -107,14 +129,15 @@ class Catalog:
             db.execute("UPDATE media SET available=0 WHERE server_id=?", (server_id,))
             db.executemany("UPDATE media SET available=1 WHERE id=?", [(id,) for id in ids])
 
-    def media(self, server_id=None, year=None, album=None):
+    def media(self, server_id=None, year=None, album=None, include_hidden=True):
         clauses, values = ["available=1"], []
         for key, value in (("server_id", server_id), ("year", year), ("album", album)):
             if value is not None:
                 clauses.append(key + "=?")
                 values.append(value)
+        having = "" if include_hidden else " AND NOT hidden_effective"
         with self.connect() as db:
-            rows = db.execute("SELECT * FROM media WHERE " + " AND ".join(clauses) +
+            rows = db.execute(f"SELECT * FROM ({SELECT}) WHERE " + " AND ".join(clauses) + having +
                               " ORDER BY year,album,source_title,id", values).fetchall()
         return [self.decode(r) for r in rows]
 
@@ -122,12 +145,27 @@ class Catalog:
         item = dict(row)
         item["resources"] = json.loads(item["resources"])
         item["title"] = item["custom_title"] or display_title(item["source_title"])
+        item["hidden_effective"] = bool(item["hidden_effective"])
         return item
 
     def get(self, id):
         with self.connect() as db:
-            row = db.execute("SELECT * FROM media WHERE id=?", (id,)).fetchone()
+            row = db.execute(SELECT + " WHERE id=?", (id,)).fetchone()
         return self.decode(row) if row else None
+
+    def hide(self, id, value):
+        with self.connect() as db:
+            db.execute("UPDATE media SET hidden=? WHERE id=?", (int(value), id))
+
+    def hide_group(self, server_id, year, album, value):
+        with self.connect() as db:
+            db.execute("INSERT OR IGNORE INTO hidden_groups VALUES(?,?,?)" if value else
+                       "DELETE FROM hidden_groups WHERE server_id=? AND year=? AND album=?", (server_id, year, album))
+
+    def hidden_groups(self, server_id):
+        with self.connect() as db:
+            return [{"year": r["year"], "album": r["album"]} for r in db.execute(
+                "SELECT year,album FROM hidden_groups WHERE server_id=? ORDER BY year,album", (server_id,))]
 
     def title(self, id, value):
         with self.connect() as db:

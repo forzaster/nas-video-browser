@@ -6,6 +6,8 @@ from pathlib import Path
 
 from .upnp import preferred
 
+NOTHING_FOUND = "動画が見つかりませんでした。取得元フォルダを確認してください"
+
 log = logging.getLogger(__name__)
 
 
@@ -17,19 +19,53 @@ def seconds(value):
         return 0
 
 
-async def run_process(*args, timeout=90):
-    proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
-                                                stderr=asyncio.subprocess.PIPE)
+def env_int(name, default):
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout)
-    except BaseException:
-        if proc.returncode is None:
-            proc.kill()
-        await proc.wait()
-        raise
+        return max(1, int(os.getenv(name, "")))
+    except ValueError:
+        return default
+
+
+# Defaults for DLNA_FFMPEG_JOBS / DLNA_THUMB_WORKERS, measured against a LinkStation: 4 workers x 4 frames
+# was ~2.9x faster than sequential; 16 slots let one crawl run uncapped while a second crawl shares them.
+FFMPEG_JOBS, THUMB_WORKERS = 16, 4
+_slots = (None, None)
+
+
+def process_slots():
+    """Process-wide cap on concurrent ffmpeg/ffprobe, shared by every crawl (one per running event loop)."""
+    global _slots
+    loop = asyncio.get_running_loop()
+    if _slots[0] is not loop:
+        _slots = (loop, asyncio.Semaphore(env_int("DLNA_FFMPEG_JOBS", FFMPEG_JOBS)))
+    return _slots[1]
+
+
+async def run_process(*args, timeout=90):
+    async with process_slots():  # the timeout starts only once a slot is free
+        proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.PIPE)
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout)
+        except BaseException:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+            raise
     if proc.returncode:
         raise RuntimeError(err.decode(errors="replace")[-800:])
     return out
+
+
+async def all_or_nothing(*coroutines):
+    """gather() that cancels and awaits the rest as soon as one fails (or on cancellation)."""
+    tasks = [asyncio.ensure_future(c) for c in coroutines]
+    try:
+        return await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def thumb_name(id, fingerprint):
@@ -46,21 +82,18 @@ async def make_thumbnail(catalog, item):
     resource = preferred(item)
     url = resource["url"]
     duration = seconds(resource.get("duration"))
-    parts = []
+    parts = [catalog.thumbs / f"{filename}.{index}.jpg" for index in range(4)]
     try:
         if not duration:
             raw = await run_process(os.getenv("FFPROBE", "ffprobe"), "-v", "error",
                 "-rw_timeout", "15000000", "-protocol_whitelist", "http,https,tcp,tls,crypto",
                 "-show_entries", "format=duration", "-of", "json", url, timeout=30)
             duration = float(json.loads(raw).get("format", {}).get("duration", 0))
-        for index, fraction in enumerate((0.1, 0.35, 0.65, 0.9)):
-            part = catalog.thumbs / f"{filename}.{index}.jpg"
-            parts.append(part)
-            await run_process(os.getenv("FFMPEG", "ffmpeg"), "-nostdin", "-y", "-v", "error",
-                "-rw_timeout", "15000000", "-protocol_whitelist", "http,https,tcp,tls,crypto",
-                "-ss", str(max(0, duration * fraction)), "-i", url, "-frames:v", "1",
-                "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2",
-                str(part))
+        await all_or_nothing(*(run_process(os.getenv("FFMPEG", "ffmpeg"), "-nostdin", "-y", "-v", "error",
+            "-rw_timeout", "15000000", "-protocol_whitelist", "http,https,tcp,tls,crypto",
+            "-ss", str(max(0, duration * fraction)), "-i", url, "-frames:v", "1",
+            "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2",
+            str(part)) for fraction, part in zip((0.1, 0.35, 0.65, 0.9), parts)))
         temporary = catalog.thumbs / f"{filename}.tmp.jpg"
         args = []
         for part in parts:
@@ -82,16 +115,16 @@ async def make_thumbnail(catalog, item):
 
 def crawl_status(state="idle"):
     # count=found, new/updated/skipped=DB rows, thumbnails=generated of thumbs_total queued, thumbs_skipped=cached
-    return {"state": state, "count": 0, "new": 0, "updated": 0, "skipped": 0,
+    # root={"id","title","auto"}: the container this crawl walked (None until chosen)
+    return {"state": state, "root": None, "count": 0, "new": 0, "updated": 0, "skipped": 0,
             "thumbnails": 0, "thumbs_total": 0, "thumbs_skipped": 0, "errors": []}
 
 
 class Crawler:
     """One crawl per server at a time; thumbnails are generated while the tree is still being scanned."""
-    workers = 2
-
     def __init__(self, catalog, network):
         self.catalog, self.network = catalog, network
+        self.workers = env_int("DLNA_THUMB_WORKERS", THUMB_WORKERS)
         self.tasks, self.status = {}, {}
 
     def state(self, id):
@@ -125,7 +158,14 @@ class Crawler:
         queue, ids = asyncio.Queue(), set()
         workers = [asyncio.create_task(self.thumbnailer(queue, status)) for _ in range(self.workers)]
         try:
-            async for item in self.network.items(device):
+            if device.get("crawl_root"):  # admin-chosen container, used as-is
+                root = {"id": device["crawl_root"], "title": device.get("crawl_root_title") or device["crawl_root"], "auto": False}
+                parent = root["title"]
+            else:  # auto: re-detected each crawl (a few Browse calls)
+                root = {**await self.network.detect_root(device), "auto": True}
+                parent = "未分類"
+            status["root"] = root
+            async for item in self.network.items(device, root["id"], parent):
                 row = self.catalog.sync(device["id"], item)
                 if row["id"] in ids:
                     continue
@@ -141,6 +181,8 @@ class Crawler:
                 if row["thumbnail"] != filename:
                     self.catalog.thumbnail(row["id"], row["fingerprint"], filename)
                 status["thumbs_skipped"] += 1
+            if not ids:  # a wrong/empty root must not mark the whole library unavailable
+                raise ValueError(NOTHING_FOUND)
             # Only after the entire tree succeeded. Failed crawls never hide existing media.
             self.catalog.finish_scan(device["id"], ids)
             status["state"] = "thumbnails"

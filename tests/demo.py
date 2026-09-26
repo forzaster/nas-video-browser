@@ -9,8 +9,18 @@ ROOT = Path(os.environ["DLNA_DEMO_DATA"])
 DEVICE = {"id": "uuid:demo", "kind": "server", "name": "動作確認用サーバー（合成動画）",
           "location": "http://127.0.0.1:8766/fixture", "model": "Test fixture"}
 
+# A tiny fake ContentDirectory tree for the source-folder picker.
+TREE = {"0": [("1", "ミュージック", 3), ("3", "ビデオ", 2)], "3": [("3$28", "全てのビデオ", 2), ("3$35", "フォルダー", 1)],
+        "3$35": [("3$35$1", "2024-01 テストアルバム", 2)]}
+
 class DemoNetwork(Network):
-    async def items(self, device):
+    async def detect_root(self, device):
+        return {"id": "3$28", "title": "全てのビデオ"}
+
+    async def containers(self, device, parent="0"):
+        return [{"id": i, "title": t, "child_count": n} for i, t, n in TREE.get(parent, [])]
+
+    async def items(self, device, root="0", parent=""):
         for n in range(2):
             xml = f'''<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
             <item id="demo-{n}" parentID="0" restricted="1"><dc:title>2024010212345{n}.mp4</dc:title><upnp:album>2024-01 テストアルバム</upnp:album><upnp:class>object.item.videoItem</upnp:class><res protocolInfo="http-get:*:video/mp4:*" duration="00:00:04" resolution="640x360">http://127.0.0.1:8766/fixture/sample.mp4</res></item></DIDL-Lite>'''
