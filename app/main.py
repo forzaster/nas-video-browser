@@ -36,6 +36,33 @@ def loopback(host):
     return address.is_loopback or bool(getattr(address, "ipv4_mapped", None) and address.ipv4_mapped.is_loopback)
 
 
+def client_rules(value):
+    """Parse DLNA_ALLOWED_CLIENTS: IPs/CIDRs, `!` prefix excludes. None when unset."""
+    entries = [e.strip() for e in (value or "").split(",") if e.strip()]
+    if not entries:
+        return None
+    rules = ([], [])
+    for entry in entries:
+        excluded = entry.startswith("!")
+        try:
+            rules[excluded].append(ipaddress.ip_network(entry.removeprefix("!").strip()))
+        except ValueError as error:
+            raise ValueError(f"DLNA_ALLOWED_CLIENTS: 不正なエントリ {entry!r} ({error})") from None
+    if not rules[0]:
+        raise ValueError("DLNA_ALLOWED_CLIENTS: 許可するIP/CIDRがありません")
+    return rules
+
+
+def client_allowed(host, rules):
+    try:
+        address = ipaddress.ip_address(host or "")
+    except ValueError:
+        return False
+    address = getattr(address, "ipv4_mapped", None) or address
+    included, excluded = rules
+    return any(address in n for n in included) and not any(address in n for n in excluded)
+
+
 class Location(BaseModel):
     url: str = Field(max_length=2048)
 
@@ -63,6 +90,7 @@ def same_site(origin, url):
 
 
 def create_app(directory=None, network=None):
+    clients = client_rules(os.getenv("DLNA_ALLOWED_CLIENTS"))
     catalog = Catalog(directory or os.getenv("DLNA_DATA", "data"))
     network = network or Network()
     crawler, player = Crawler(catalog, network), Player(catalog, network)
@@ -84,8 +112,11 @@ def create_app(directory=None, network=None):
         # Host allowlist blocks DNS rebinding; without a token only loopback clients are served.
         if request.url.hostname is None or bare(request.url.hostname) not in allowed_hosts():
             return JSONResponse({"detail": "許可されていないホスト名です"}, status_code=400)
+        host = request.client and request.client.host
+        if clients and not loopback(host) and not client_allowed(host, clients):
+            return JSONResponse({"detail": "許可されていない接続元です"}, status_code=403)
         token = os.getenv("DLNA_TOKEN")
-        if not token and not loopback(request.client and request.client.host):
+        if not token and not loopback(host):
             return JSONResponse({"detail": "LANから使うにはDLNA_TOKENを設定してください"}, status_code=403)
         if token and not secrets.compare_digest(request.cookies.get("dlna_token", ""), token):
             supplied = request.headers.get("Authorization", "").removeprefix("Bearer ")

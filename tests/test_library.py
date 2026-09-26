@@ -2,6 +2,8 @@ import asyncio
 import json
 from unittest.mock import AsyncMock
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from app.catalog import Catalog, display_title, year_for
@@ -155,6 +157,36 @@ def test_lan_client_requires_token(tmp_path, monkeypatch):
     with TestClient(create_app(tmp_path), **lan) as client:
         assert client.get("/api/devices").status_code == 401
         assert client.get("/api/devices", headers={"Authorization": "Bearer secret"}).status_code == 200
+
+
+def test_client_allowlist(tmp_path, monkeypatch):
+    monkeypatch.setenv("DLNA_TOKEN", "secret")
+    monkeypatch.setenv("DLNA_ALLOWED_HOSTS", "192.168.1.10")
+    auth = {"Authorization": "Bearer secret"}
+    def get(ip, base_url="http://192.168.1.10:8000"):
+        with TestClient(create_app(tmp_path), base_url=base_url, client=(ip, 50000)) as client:
+            return client.get("/api/devices", headers=auth)
+    monkeypatch.delenv("DLNA_ALLOWED_CLIENTS", raising=False)
+    assert get("10.9.9.9").status_code == 200  # unset: old behavior
+    monkeypatch.setenv("DLNA_ALLOWED_CLIENTS", " 192.168.1.0/24, !192.168.1.1 ")
+    assert get("192.168.1.20").status_code == 200
+    assert get("::ffff:192.168.1.20").status_code == 200
+    response = get("10.9.9.9")
+    assert response.status_code == 403 and response.json()["detail"] == "許可されていない接続元です"
+    assert get("192.168.1.1").status_code == 403
+    assert get("::ffff:192.168.1.1").status_code == 403
+    assert get("testclient").status_code == 403
+    assert get("127.0.0.1", "http://localhost").status_code == 200
+    assert get("::1", "http://localhost").status_code == 200
+    assert get("::ffff:127.0.0.1", "http://localhost").status_code == 200
+    with TestClient(create_app(tmp_path), base_url="http://192.168.1.10:8000", client=("192.168.1.20", 50000)) as client:
+        assert client.get("/api/devices").status_code == 401  # token still required
+    monkeypatch.delenv("DLNA_TOKEN")
+    assert get("192.168.1.20").status_code == 403  # no token: LAN still refused
+    for bad in ("192.168.1.0/33", "not-an-ip", "!", "192.168.1.5/24", "!192.168.1.1"):
+        monkeypatch.setenv("DLNA_ALLOWED_CLIENTS", bad)
+        with pytest.raises(ValueError, match="DLNA_ALLOWED_CLIENTS"):
+            create_app(tmp_path)
 
 
 def test_device_errors_are_not_leaked(tmp_path, monkeypatch, caplog):
