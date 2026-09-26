@@ -48,6 +48,17 @@ SQLiteには機器、元タイトル、追加タイトル、年、アルバム�
 LANの別端末から開く場合は、そのURLに使うMacのIPアドレスやホスト名を `DLNA_ALLOWED_HOSTS` にカンマ区切りで指定します（例: `DLNA_ALLOWED_HOSTS=192.168.1.10,my-mac.local`、ポートは不要）。
 接続元IPを絞る場合は `DLNA_ALLOWED_CLIENTS` にIP/CIDRをカンマ区切りで指定し、`!` を付けたものは除外します（例: `DLNA_ALLOWED_CLIENTS=192.168.1.0/24,!192.168.1.1`）。ループバックは常に許可され、トークンも引き続き必要です。
 ルーターのLAN側アドレスを除外するのは、ポート転送・VPN・ヘアピンNATの通信がルーターのIPから来たように見え、外部からの接続がLAN内扱いになるのを防ぐためです。不正な指定があると起動時にエラーになります。
+
+起動例（MacのmDNSホスト名が `mymac.local`、LANが `192.168.1.0/24`、ルーターが `192.168.1.1` の場合）:
+
+```bash
+DLNA_TOKEN="自分で決めた長いトークン" \
+DLNA_ALLOWED_HOSTS="mymac.local" \
+DLNA_ALLOWED_CLIENTS='192.168.1.0/24,!192.168.1.1' \
+uv run uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8765
+```
+
+LAN内の端末から http://mymac.local:8765 を開きます。`!` はbash/zshの履歴展開と衝突するため（ダブルクォート内でも展開されます）、`DLNA_ALLOWED_CLIENTS` の値はシングルクォートで囲んでください。
 ブラウザのログインフォームに同じトークンを入力してください。これは家庭内LAN向けです。インターネットへ直接公開する構成ではありません。
 SSDPの送信インターフェースを固定する場合は `DLNA_INTERFACE` にMacのLAN側IPv4アドレスを指定します。
 `FFMPEG` / `FFPROBE`で実行ファイルのパスを指定できます。
