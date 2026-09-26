@@ -17,6 +17,7 @@ htmlcov/
 
 # Runtime data (SQLite catalog, thumbnails)
 data/
+/data
 *.sqlite3
 *.sqlite3-journal
 

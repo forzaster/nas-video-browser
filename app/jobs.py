@@ -2,7 +2,10 @@ import asyncio
 import json
 import logging
 import os
+import time
 from pathlib import Path
+
+from async_upnp_client.exceptions import UpnpActionError
 
 from .upnp import preferred
 
@@ -200,14 +203,67 @@ class Crawler:
             await asyncio.gather(*workers, return_exceptions=True)
 
 
+class Unplayable(ValueError):
+    """The renderer cannot play this (code for the client: unplayable / all_failed / push_failed)."""
+    def __init__(self, message, code="unplayable"):
+        super().__init__(message)
+        self.code = code
+
+
+# Transport states in which a freshly pushed item is still "not started yet" (PAUSED is the user's choice).
+WAITING = ("TRANSITIONING", "STOPPED", "NO_MEDIA_PRESENT", "UNKNOWN", "")
+
+
 class Player:
-    """A queue per renderer survives closing the browser, not a server restart."""
+    """A queue per renderer survives closing the browser, not a server restart.
+
+    Renderer capabilities (ConnectionManager Sink) are cached for `caps_ttl` seconds together with the items
+    that failed at runtime on that renderer, so /plan and auto-advance skip them without retrying."""
     def __init__(self, catalog, network):
         self.catalog, self.network = catalog, network
-        self.states, self.tasks, self.locks = {}, {}, {}
+        self.states, self.tasks, self.locks, self.caps = {}, {}, {}, {}
+        self.poll, self.start_timeout, self.caps_ttl = 2, 20, 600
 
     def lock(self, id):
         return self.locks.setdefault(id, asyncio.Lock())
+
+    async def capabilities(self, device):
+        entry = self.caps.get(device["id"])
+        if entry and time.monotonic() - entry["at"] < self.caps_ttl:
+            return entry
+        try:
+            sinks = await self.network.sink_protocols(device) or None
+        except Exception as error:  # no ConnectionManager / unreachable: unknown, try and watch at runtime
+            log.info("sink protocols unavailable for %s: %s", device.get("name"), error)
+            sinks = None
+        entry = self.caps[device["id"]] = {"at": time.monotonic(), "sinks": sinks, "rejected": set()}
+        return entry
+
+    async def playable(self, device, item):
+        """True / False (known incompatible or failed before) / None (unknown: assume playable)."""
+        if not item or not item["available"]:
+            return False
+        entry = await self.capabilities(device)
+        if item["id"] in entry["rejected"]:
+            return False
+        if entry["sinks"] is None:
+            return None
+        return preferred(item, sinks=entry["sinks"]) is not None
+
+    async def plan(self, device, ids):
+        return [{"id": id, "playable": await self.playable(device, self.catalog.get(id))} for id in ids]
+
+    @staticmethod
+    def skip(state, id):
+        """`skipped` counts distinct items passed over in this session."""
+        state.setdefault("skipped_ids", [])
+        if id not in state["skipped_ids"]:
+            state["skipped_ids"].append(id)
+        state["skipped"] = len(state["skipped_ids"])
+
+    def reject(self, device, state):
+        state["failed_ids"].append(state["media_id"])
+        self.caps.get(device["id"], {"rejected": set()})["rejected"].add(state["media_id"])
 
     async def start(self, device, ids, repeat):
         async with self.lock(device["id"]):
@@ -215,13 +271,20 @@ class Player:
             if old:
                 old.cancel()
                 await asyncio.gather(old, return_exceptions=True)
-            state = {"queue": ids, "index": 0, "repeat": repeat, "state": "BUFFERING",
-                     "position": "", "duration": "", "error": None}
+            state = {"queue": ids, "index": 0, "repeat": repeat, "state": "BUFFERING", "renderer": device.get("name"),
+                     "position": "", "duration": "", "error": None, "failure": None, "skipped": 0,
+                     "skipped_ids": [], "failed_ids": [], "played": False}
             self.states[device["id"]] = state
             try:
+                if await self.playable(device, self.catalog.get(ids[0])) is False:
+                    raise Unplayable(f"{device.get('name') or '再生先'}が対応していない形式です")
                 await self.load_track(device, state)
             except Exception as error:
-                state.update(state="ERROR", error=str(error))
+                code = getattr(error, "code", "push_failed")
+                if isinstance(error, UpnpActionError):  # the device answered and refused this media
+                    code = "unplayable"
+                    self.reject(device, state)
+                state.update(state="ERROR", error=str(error), failure=code)
                 raise
             self.tasks[device["id"]] = asyncio.create_task(self.monitor(device, state))
             return state
@@ -230,17 +293,55 @@ class Player:
         item = self.catalog.get(state["queue"][state["index"]])
         if not item or not item["available"]:
             raise ValueError("動画が見つかりません。再クロールしてください")
-        resource = preferred(item)
-        state.update(media_id=item["id"], title=item["title"], uri=resource["url"],
-                     state="BUFFERING", position="", duration=resource["duration"], seen_playing=False)
+        resource = preferred(item, sinks=(await self.capabilities(device))["sinks"])
+        if not resource:
+            raise Unplayable(f"{device.get('name') or '再生先'}が対応していない形式です")
+        state.update(media_id=item["id"], title=item["title"], uri=resource["url"], state="BUFFERING",
+                     position="", duration=resource["duration"], seen_playing=False, loaded_at=time.monotonic(),
+                     waiting_polls=0)
         await self.network.command(device, "SetAVTransportURI", CurrentURI=resource["url"],
                                    CurrentURIMetaData=item["metadata"])
         await self.network.command(device, "Play", Speed="1")
 
+    async def next_track(self, device, state):
+        """Advance to the next item this renderer can play; False at the end of a non-repeating queue.
+        Known-incompatible items and ones the renderer refused are skipped; raises when none is left."""
+        queue = state["queue"]
+        for _ in range(len(queue)):
+            state["index"] += 1
+            if state["index"] >= len(queue):
+                if not state["repeat"]:
+                    state["index"] = len(queue) - 1
+                    return False
+                state["index"] = 0
+            id = queue[state["index"]]
+            if id in state.get("failed_ids", ()) or await self.playable(device, self.catalog.get(id)) is False:
+                self.skip(state, id)
+                continue
+            state["last_position"] = 0
+            try:
+                await self.load_track(device, state)
+                return True
+            except UpnpActionError:  # refused this media (e.g. illegal MIME type): skip it
+                state["media_id"] = id
+                self.reject(device, state)
+                self.skip(state, id)
+        raise Unplayable("キュー内にこの機器で再生できる動画がありません", "all_failed")
+
+    async def never_started(self, device, state):
+        """The renderer did not reach PLAYING for the current item. Returns False when the session ends."""
+        self.reject(device, state)
+        if not state.get("played"):  # the item the user picked: stop so the client can fall back to the browser
+            state.update(state="ERROR", failure="unplayable",
+                         error=f"{device.get('name') or '再生先'}で再生を開始できませんでした")
+            return False
+        self.skip(state, state["media_id"])
+        return await self.next_track(device, state)
+
     async def monitor(self, device, state):
         try:
             while True:
-                await asyncio.sleep(2)
+                await asyncio.sleep(self.poll)
                 transport = await self.network.command(device, "GetTransportInfo")
                 position = await self.network.command(device, "GetPositionInfo")
                 current = transport.get("CurrentTransportState", "UNKNOWN")
@@ -253,27 +354,30 @@ class Player:
                     state["state"] = "EXTERNAL_CONTROL"
                     return
                 if current == "PLAYING":
-                    state["seen_playing"] = True
+                    state.update(seen_playing=True, played=True)
+                if not state["seen_playing"] and "loaded_at" in state:
+                    # Never started: an error status, a few STOPPED polls in a row, or no PLAYING in time.
+                    state["waiting_polls"] = state.get("waiting_polls", 0) + 1 if current in ("STOPPED", "NO_MEDIA_PRESENT") else 0
+                    failed = (transport.get("CurrentTransportStatus") == "ERROR_OCCURRED" or current == "ERROR"
+                              or state["waiting_polls"] >= 4
+                              or (current in WAITING and time.monotonic() - state["loaded_at"] > self.start_timeout))
+                    if failed and not await self.never_started(device, state):
+                        return
+                    continue
                 if current == "STOPPED" and state["seen_playing"]:
                     # A pause/stall is NOT completion. Confirm proximity to the end.
                     length = seconds(state["duration"])
                     progress = max(seconds(state["position"]), state.get("last_position", 0))
                     if not length or progress < max(0, length - 4):
                         return
-                    state["index"] += 1
-                    if state["index"] >= len(state["queue"]):
-                        if not state["repeat"]:
-                            state["index"] = len(state["queue"]) - 1
-                            return
-                        state["index"] = 0
-                    state["last_position"] = 0
-                    await self.load_track(device, state)
+                    if not await self.next_track(device, state):
+                        return
                 else:
                     state["last_position"] = seconds(state["position"])
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            state.update(state="ERROR", error=str(error))
+            state.update(state="ERROR", error=str(error), failure=getattr(error, "code", "push_failed"))
 
     async def control(self, device, action):
         async with self.lock(device["id"]):

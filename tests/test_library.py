@@ -5,12 +5,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from async_upnp_client.exceptions import UpnpActionError
 from fastapi.testclient import TestClient
 
 from app.catalog import Catalog, display_title, year_for
 from app.jobs import THUMB_WORKERS, Crawler, Player, make_thumbnail, process_slots, run_process
 from app.main import create_app
-from app.upnp import Network, parse_didl
+from app.upnp import Network, parse_didl, parse_protocols, preferred
 
 SERVER = {"id": "uuid:server", "name": "MiniDLNA", "kind": "server", "location": "http://localhost/description.xml", "model": "test"}
 RENDERER = {**SERVER, "id": "uuid:tv", "kind": "renderer", "name": "TV"}
@@ -791,3 +792,134 @@ def test_crawl_root_api_is_admin_only(tmp_path, monkeypatch):
         assert client.put(path + "crawl-root", headers=ADMIN, json={"id": "x" * 1025}).status_code == 422
         assert client.put(path + "crawl-root", headers=ADMIN, json={"id": ""}).status_code == 422
         assert client.put(path + "crawl-root", headers=ADMIN, json={"id": None}).json()["id"] is None
+
+
+SINK = ("http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_HP_HD_AAC;DLNA.ORG_OP=01, rtsp-rtp-udp:*:video/x-other:*,"
+        "http-get:*:video/mp2t:DLNA.ORG_PN=AVC_TS_JP_AAC_T;DLNA.ORG_FLAGS=01,http-get:*:audio/mpeg:*")
+
+
+def media(name, *kinds, pn=None):
+    """An item with one resource per kind (mp4 / m2ts / mkv) at a name-specific URL."""
+    source = item()
+    source["object_id"] = name
+    mimes = {"mp4": "video/mp4", "m2ts": "video/vnd.dlna.mpeg-tts", "mkv": "video/x-matroska"}
+    source["resources"] = [{"url": f"http://localhost/{name}.{k}", "mime": mimes[k], "duration": "00:00:20",
+                            "protocol": f"http-get:*:{mimes[k]}:" + (f"DLNA.ORG_PN={pn}" if pn else "*"),
+                            "size": "", "resolution": ""} for k in kinds]
+    return source
+
+
+def test_sink_parsing_and_resource_matching():
+    sinks = parse_protocols(SINK)
+    assert sinks == [{"mime": "video/mp4", "pn": "AVC_MP4_HP_HD_AAC"}, {"mime": "video/mp2t", "pn": "AVC_TS_JP_AAC_T"},
+                     {"mime": "audio/mpeg", "pn": None}]
+    both = media("a", "mp4", "m2ts")
+    assert preferred(both)["url"].endswith(".m2ts")  # unknown sink: previous preference
+    assert preferred(both, sinks=sinks)["url"].endswith(".m2ts")  # mp2t is an alias of vnd.dlna.mpeg-tts
+    assert preferred(both, sinks=parse_protocols("http-get:*:video/mp4:*"))["url"].endswith(".mp4")
+    assert preferred(media("b", "mkv"), sinks=sinks) is None
+    assert preferred(media("b", "mkv"), sinks=parse_protocols("http-get:*:video/*:*")) is not None
+    # PN is compared only when both sides name one.
+    assert preferred(media("c", "m2ts", pn="AVC_TS_JP_AAC_T"), sinks=sinks) is not None
+    assert preferred(media("c", "m2ts", pn="AVC_TS_EU_ISO"), sinks=sinks) is None
+    assert preferred(media("c", "m2ts", pn="AVC_TS_EU_ISO"), sinks=parse_protocols("http-get:*:video/mp2t:*")) is not None
+    assert preferred(media("c", "m2ts"), sinks=parse_protocols("")) is not None  # empty list = unknown
+
+
+class FakeRenderer:
+    """AVTransport stand-in: `plays(uri)` decides whether a pushed URI ever reaches PLAYING; a playing track ends
+    on its second poll. sinks=None: no ConnectionManager."""
+    def __init__(self, sinks="http-get:*:video/mp4:*", plays=lambda uri: True, fail=None):
+        self.sinks, self.plays, self.fail, self.uri, self.pushed, self.polls = sinks, plays, fail, None, [], 0
+
+    async def sink_protocols(self, device):
+        if self.sinks is None:
+            raise ValueError("ConnectionManagerサービスがありません")
+        return parse_protocols(self.sinks)
+
+    async def command(self, device, action, **kwargs):
+        if self.fail:
+            raise self.fail
+        if action == "SetAVTransportURI":
+            self.uri, self.polls = kwargs["CurrentURI"], 0
+            self.pushed.append(self.uri)
+        if action == "GetTransportInfo":
+            self.polls += 1
+            playing = self.plays(self.uri)
+            return {"CurrentTransportState": ("PLAYING" if self.polls < 2 else "STOPPED") if playing else "TRANSITIONING"}
+        if action == "GetPositionInfo":
+            return {"TrackURI": self.uri, "RelTime": "00:00:20" if self.polls >= 2 else "00:00:01", "TrackDuration": "00:00:20"}
+        return {}
+
+
+def run_queue(tmp_path, net, sources, repeat=False, timeout=0.05):
+    db = Catalog(tmp_path)
+    ids = [db.upsert(SERVER["id"], s) for s in sources]
+    player = Player(db, net)
+    player.poll, player.start_timeout = 0, timeout
+    async def run():
+        await player.start(RENDERER, ids, repeat)
+        await asyncio.wait_for(player.tasks[RENDERER["id"]], 5)
+        return player.states[RENDERER["id"]], await player.plan(RENDERER, ids)
+    return ids, *asyncio.run(run())
+
+
+def test_auto_advance_skips_incompatible_items(tmp_path):
+    net = FakeRenderer()
+    ids, state, plan = run_queue(tmp_path, net, [media("a", "mp4", "m2ts"), media("b", "m2ts"), media("c", "mp4")])
+    assert net.pushed == ["http://localhost/a.mp4", "http://localhost/c.mp4"]
+    assert state["skipped"] == 1 and state["index"] == 2 and state["failure"] is None
+    assert [p["playable"] for p in plan] == [True, False, True]
+
+
+def test_runtime_failures_are_skipped_and_all_failing_stops(tmp_path):
+    net = FakeRenderer(sinks=None)  # unknown: everything is tried
+    net.plays = lambda uri: uri.endswith("a.mp4") and net.pushed.count(uri) == 1
+    ids, state, plan = run_queue(tmp_path, net, [media("a", "mp4"), media("b", "mp4"), media("c", "mp4")], repeat=True)
+    assert net.pushed == [f"http://localhost/{n}.mp4" for n in "abca"]
+    assert state["state"] == "ERROR" and state["failure"] == "all_failed" and state["skipped"] == 3
+    assert [p["playable"] for p in plan] == [False, False, False]  # remembered for this renderer
+
+
+def test_never_playing_first_item_reports_unplayable(tmp_path):
+    net = FakeRenderer(sinks=None, plays=lambda uri: False)
+    ids, state, plan = run_queue(tmp_path, net, [media("a", "mp4"), media("b", "mp4")])
+    assert net.pushed == ["http://localhost/a.mp4"]  # the user's pick is not skipped: the client falls back
+    assert state["state"] == "ERROR" and state["failure"] == "unplayable"
+    assert [p["playable"] for p in plan] == [False, None]
+
+
+def test_plan_and_queue_failures_carry_codes(tmp_path):
+    net = FakeRenderer(sinks="http-get:*:video/mp4:*")
+    app = create_app(tmp_path, net)
+    db = app.state.catalog
+    db.device(RENDERER)
+    db.device({**RENDERER, "id": "uuid:old", "name": "古いTV"})
+    a, b = db.upsert(SERVER["id"], media("a", "mp4")), db.upsert(SERVER["id"], media("b", "m2ts"))
+    with TestClient(app, raise_server_exceptions=False, **LOCAL) as client:
+        response = client.post("/api/renderers/uuid:tv/plan", headers=HEADERS, json={"ids": [a, b]})
+        assert response.json() == [{"id": a, "playable": True}, {"id": b, "playable": False}]
+        assert client.post("/api/renderers/uuid:tv/plan", headers=HEADERS, json={"ids": ["missing"]}).status_code == 404
+        response = client.post("/api/renderers/uuid:tv/queue", headers=HEADERS, json={"ids": [b]})
+        assert response.status_code == 422 and response.json()["detail"]["code"] == "unplayable" and not net.pushed
+        net.sinks = None  # unknown sink: assume playable
+        app.state.player.caps.clear()
+        assert client.post("/api/renderers/uuid:old/plan", headers=HEADERS, json={"ids": [b]}).json()[0]["playable"] is None
+        net.fail = OSError("connect to 10.0.0.9 refused")
+        response = client.post("/api/renderers/uuid:old/queue", headers=HEADERS, json={"ids": [a]})
+        assert response.status_code == 502 and response.json()["detail"]["code"] == "push_failed"
+        assert "10.0.0.9" not in response.text and "古いTV" in response.json()["detail"]["message"]
+        net.fail = UpnpActionError(error_code=714, error_desc="Illegal MIME-type")
+        response = client.post("/api/renderers/uuid:old/queue", headers=HEADERS, json={"ids": [a]})
+        assert response.status_code == 502 and response.json()["detail"]["code"] == "unplayable"
+        assert client.post("/api/renderers/uuid:old/plan", headers=HEADERS, json={"ids": [a]}).json()[0]["playable"] is False
+        assert client.get("/api/renderers/uuid:old/state").json()["failure"] == "unplayable"
+
+
+def test_guest_cannot_plan_or_queue_hidden_items(tmp_path, monkeypatch):
+    app, (id,) = role_app(tmp_path, monkeypatch)
+    app.state.catalog.hide(id, True)
+    with TestClient(app, **LAN) as client:
+        for path in ("plan", "queue"):
+            assert client.post(f"/api/renderers/uuid:tv/{path}", headers=GUEST, json={"ids": [id]}).status_code == 404
+            assert client.post(f"/api/renderers/uuid:tv/{path}", headers=ADMIN, json={"ids": [id]}).status_code == 200

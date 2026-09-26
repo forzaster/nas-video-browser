@@ -62,14 +62,55 @@ def named(entries, names):
     return next((e for e in entries if e["container"] and e["title"].strip().casefold() in names), None)
 
 
-def preferred(item, browser=False):
+# Spellings of the same container that renderers and servers use interchangeably.
+MIME_ALIASES = [{"video/vnd.dlna.mpeg-tts", "video/mp2t", "video/m2ts", "video/mpeg2-ts"},
+                {"video/x-matroska", "video/x-mkv", "video/mkv"}, {"video/x-msvideo", "video/avi", "video/msvideo"},
+                {"video/x-ms-wmv", "video/wmv"}, {"video/quicktime", "video/mov"}]
+
+
+def profile(protocol):
+    """DLNA.ORG_PN of a protocolInfo 4th field (None when absent or `*`)."""
+    fields = protocol.split(":", 3)[3] if protocol.count(":") >= 3 else ""
+    return next((f.split("=", 1)[1].strip() or None for f in fields.split(";")
+                 if f.strip().upper().startswith("DLNA.ORG_PN=")), None)
+
+
+def parse_protocols(value):
+    """ConnectionManager Sink/Source CSV -> [{"mime", "pn"}] for http-get (or `*`) entries."""
+    result = []
+    for entry in (value or "").split(","):
+        entry = entry.strip()
+        parts = entry.split(":", 3)
+        if len(parts) == 4 and parts[0].strip().lower() in ("http-get", "*") and parts[2].strip():
+            result.append({"mime": parts[2].strip().lower(), "pn": profile(entry)})
+    return result
+
+
+def mime_matches(sink, mime):
+    if sink in ("*", "*/*", mime):
+        return True
+    if sink.endswith("/*"):
+        return mime.startswith(sink[:-1])
+    return any(sink in group and mime in group for group in MIME_ALIASES)
+
+
+def compatible(resource, sinks):
+    """sinks=None means unknown: assume playable and rely on runtime failure detection."""
+    if not sinks:
+        return True
+    mime, pn = (resource.get("mime") or "").strip().lower(), profile(resource.get("protocol", ""))
+    return any(mime_matches(s["mime"], mime) and not (s["pn"] and pn and s["pn"] != pn) for s in sinks)
+
+
+def preferred(item, browser=False, sinks=None):
     resources = item["resources"]
     if browser:
         return next((r for r in resources if r["mime"] == "video/mp4" or
                      urlparse(r["url"]).path.lower().endswith(".mp4")), None)
-    # Preserve the original preference for transport-stream originals over MP4.
+    # Among what the renderer accepts, keep the preference for transport-stream originals over MP4.
+    resources = [r for r in resources if compatible(r, sinks)]
     return next((r for r in resources if "mpeg-tts" in r["mime"] or
-                 urlparse(r["url"]).path.lower().endswith((".m2ts", ".mts"))), resources[0])
+                 urlparse(r["url"]).path.lower().endswith((".m2ts", ".mts"))), resources[0] if resources else None)
 
 
 class Network:
@@ -186,6 +227,11 @@ class Network:
                 start += count
                 if start >= total:
                     break
+
+    async def sink_protocols(self, device):
+        """What a renderer accepts, from ConnectionManager GetProtocolInfo. Read-only; raises when unavailable."""
+        service = await self.service(device, "ConnectionManager")
+        return parse_protocols((await service.action("GetProtocolInfo").async_call()).get("Sink", ""))
 
     async def command(self, device, action, **kwargs):
         service = await self.service(device, "AVTransport")
