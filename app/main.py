@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -71,9 +71,41 @@ class Title(BaseModel):
     title: str = Field(max_length=300)
 
 
+class Group(BaseModel):
+    year: str = Field(min_length=1, max_length=300)
+    album: str = Field("", max_length=1000)  # "" = the whole year
+
+
 class Queue(BaseModel):
     ids: list[str] = Field(min_length=1, max_length=10000)
     repeat: bool = True
+
+
+def tokens():
+    """(admin, guest). DLNA_TOKEN is a legacy alias for DLNA_ADMIN_TOKEN."""
+    admin, legacy = os.getenv("DLNA_ADMIN_TOKEN", ""), os.getenv("DLNA_TOKEN", "")
+    guest = os.getenv("DLNA_GUEST_TOKEN", "")
+    if admin and legacy and admin != legacy:
+        raise ValueError("DLNA_ADMIN_TOKEN と DLNA_TOKEN が異なります（DLNA_TOKENは管理者トークンの旧名です）")
+    admin = admin or legacy
+    if guest and not admin:
+        raise ValueError("DLNA_GUEST_TOKEN を使うには DLNA_ADMIN_TOKEN も設定してください")
+    if guest and guest == admin:
+        raise ValueError("DLNA_ADMIN_TOKEN と DLNA_GUEST_TOKEN には別の値を設定してください")
+    return admin, guest
+
+
+def role_for(supplied, admin, guest):
+    supplied, role = (supplied or "").encode(), None
+    for name, token in (("guest", guest), ("admin", admin)):  # compare against every token
+        if token and secrets.compare_digest(supplied, token.encode()):
+            role = name
+    return role
+
+
+def require_admin(request: Request):
+    if getattr(request.state, "role", None) != "admin":
+        raise HTTPException(403, "管理者のみ操作できます")
 
 
 def port(url):
@@ -91,6 +123,7 @@ def same_site(origin, url):
 
 def create_app(directory=None, network=None):
     clients = client_rules(os.getenv("DLNA_ALLOWED_CLIENTS"))
+    admin_token, guest_token = tokens()
     catalog = Catalog(directory or os.getenv("DLNA_DATA", "data"))
     network = network or Network()
     crawler, player = Crawler(catalog, network), Player(catalog, network)
@@ -115,14 +148,17 @@ def create_app(directory=None, network=None):
         host = request.client and request.client.host
         if clients and not loopback(host) and not client_allowed(host, clients):
             return JSONResponse({"detail": "許可されていない接続元です"}, status_code=403)
-        token = os.getenv("DLNA_TOKEN")
-        if not token and not loopback(host):
-            return JSONResponse({"detail": "LANから使うにはDLNA_TOKENを設定してください"}, status_code=403)
-        if token and not secrets.compare_digest(request.cookies.get("dlna_token", ""), token):
+        if not admin_token:
+            if not loopback(host):
+                return JSONResponse({"detail": "LANから使うにはDLNA_ADMIN_TOKENを設定してください"}, status_code=403)
+            request.state.role = "admin"
+        else:
             supplied = request.headers.get("Authorization", "").removeprefix("Bearer ")
-            if request.url.path not in ("/", "/static/app.js", "/static/style.css", "/api/login"):
-                if not secrets.compare_digest(supplied, token):
-                    return JSONResponse({"detail": "ログインしてください"}, status_code=401)
+            request.state.role = (role_for(supplied, admin_token, guest_token)  # explicit header wins
+                                  or role_for(request.cookies.get("dlna_token"), admin_token, guest_token))
+            exempt = ("/", "/static/app.js", "/static/style.css", "/api/login", "/api/logout")
+            if not request.state.role and request.url.path not in exempt:
+                return JSONResponse({"detail": "ログインしてください"}, status_code=401)
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             origin = request.headers.get("origin")
             if origin and not same_site(origin, request.url):
@@ -152,13 +188,24 @@ def create_app(directory=None, network=None):
     @app.post("/api/login")
     async def login(request: Request):
         data = await request.json()
-        supplied = data.get("token", "")
-        if not isinstance(supplied, str) or not secrets.compare_digest(supplied, os.getenv("DLNA_TOKEN", "")):
+        supplied = data.get("token", "") if isinstance(data, dict) else ""
+        role = isinstance(supplied, str) and role_for(supplied, admin_token, guest_token)
+        if not role:
             raise HTTPException(401, "トークンが違います")
-        response = JSONResponse({"ok": True})
+        response = JSONResponse({"role": role})
         response.set_cookie("dlna_token", supplied, httponly=True, samesite="strict",
                             secure=request.url.scheme == "https")
         return response
+
+    @app.post("/api/logout")
+    def logout():
+        response = JSONResponse({"ok": True})
+        response.delete_cookie("dlna_token", httponly=True, samesite="strict")
+        return response
+
+    @app.get("/api/me")
+    def me(request: Request):
+        return {"role": request.state.role, "auth": bool(admin_token)}
 
     @app.get("/api/devices")
     def devices():
@@ -171,7 +218,7 @@ def create_app(directory=None, network=None):
             catalog.device(item)
         return {"devices": results, "errors": errors}
 
-    @app.post("/api/devices")
+    @app.post("/api/devices", dependencies=[Depends(require_admin)])
     async def add(location: Location):
         if urlparse(location.url).scheme not in ("http", "https"):
             raise HTTPException(422, "機器URLはhttp(s)で指定してください")
@@ -196,11 +243,44 @@ def create_app(directory=None, network=None):
         return crawler.state(id)
 
     @app.get("/api/media")
-    def media(server_id: str, year: str | None = None, album: str | None = None):
+    def media(request: Request, server_id: str, year: str | None = None, album: str | None = None,
+              include_hidden: bool = False):
+        # Guests never receive hidden rows; admins only when they ask for them.
+        show = include_hidden and request.state.role == "admin"
         return [{k: v for k, v in row.items() if k != "metadata"}
-                for row in catalog.media(server_id, year, album)]
+                for row in catalog.media(server_id, year, album, include_hidden=show)]
 
-    @app.patch("/api/media/{id}/title")
+    @app.get("/api/hidden", dependencies=[Depends(require_admin)])
+    def hidden(server_id: str):
+        return {"groups": catalog.hidden_groups(server_id)}
+
+    @app.put("/api/servers/{id}/hidden", dependencies=[Depends(require_admin)])
+    def hide_group(id: str, body: Group):
+        device(id, "server")
+        catalog.hide_group(id, body.year, body.album, True)
+        return {"hidden": True}
+
+    @app.delete("/api/servers/{id}/hidden", dependencies=[Depends(require_admin)])
+    def show_group(id: str, body: Group):
+        device(id, "server")
+        catalog.hide_group(id, body.year, body.album, False)
+        return {"hidden": False}
+
+    def hide_item(id, value):
+        if not catalog.get(id):
+            raise HTTPException(404, "動画が見つかりません")
+        catalog.hide(id, value)
+        return {"hidden": value}
+
+    @app.put("/api/media/{id}/hidden", dependencies=[Depends(require_admin)])
+    def hide(id: str):
+        return hide_item(id, True)
+
+    @app.delete("/api/media/{id}/hidden", dependencies=[Depends(require_admin)])
+    def show(id: str):
+        return hide_item(id, False)
+
+    @app.patch("/api/media/{id}/title", dependencies=[Depends(require_admin)])
     def title(id: str, body: Title):
         if not catalog.get(id):
             raise HTTPException(404, "動画が見つかりません")
@@ -208,10 +288,10 @@ def create_app(directory=None, network=None):
         return {"title": catalog.get(id)["title"]}
 
     @app.post("/api/renderers/{id}/queue")
-    async def queue(id: str, body: Queue):
+    async def queue(request: Request, id: str, body: Queue):
         for media_id in body.ids:
             item = catalog.get(media_id)
-            if not item or not item["available"]:
+            if not item or not item["available"] or (item["hidden_effective"] and request.state.role != "admin"):
                 raise HTTPException(404, "動画が見つかりません")
         try:
             return await player.start(device(id, "renderer"), body.ids, body.repeat)

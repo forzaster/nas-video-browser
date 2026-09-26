@@ -35,6 +35,10 @@
             <button class="btn primary">登録</button>
           </form>
         </details>
+        <div id="account" class="account" hidden>
+          <span id="role" class="role-pill"></span>
+          <button id="logout" class="btn ghost" type="button" hidden>ログアウト</button>
+        </div>
       </div>
     </section>
   </div>
@@ -57,7 +61,10 @@
 
   <p id="message" class="notice" role="status"></p>
 
-  <nav id="breadcrumbs" class="crumbs" aria-label="階層"></nav>
+  <div class="browse-bar">
+    <nav id="breadcrumbs" class="crumbs" aria-label="階層"></nav>
+    <label id="show-hidden-wrap" class="switch show-hidden" hidden><input id="show-hidden" type="checkbox"><span class="switch-track" aria-hidden="true"></span><span class="switch-label">非表示も表示</span></label>
+  </div>
   <main id="content">
     <div class="empty"><span class="empty-icon" aria-hidden="true"></span>
       <p class="empty-title">ライブラリを準備しましょう</p>

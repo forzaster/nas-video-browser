@@ -2,6 +2,9 @@
 const $ = id => document.getElementById(id);
 let media = [], year = null, album = null, editId = null, queue = [], index = 0, activeRenderer = '', playingId = null;
 let fetchVersion = 0, scanWasRunning = false, mediaSignature = '';
+let role = null, hiddenGroups = new Set();
+const isAdmin = () => role === 'admin', showHidden = () => isAdmin() && $('show-hidden').checked;
+const groupKey = (y, a = '') => y + '\0' + a;
 const enc = encodeURIComponent;
 function el(tag, text, cls) { const n = document.createElement(tag); if(text !== undefined) n.textContent = text; if(cls)n.className = cls; return n; }
 function message(text, detail = '') { $('message').textContent = text; $('message').title = detail; }
@@ -25,11 +28,12 @@ async function devices() {
 // Periodic refreshes skip re-rendering when nothing changed, so hover/scroll/focus survive.
 async function refresh(force = true) {
   const version = ++fetchVersion, server = $('server').value;
-  const result = server ? await api('/media?server_id='+enc(server)) : [];
+  const all = showHidden(), query = '?server_id='+enc(server);
+  const [result, hidden] = server ? await Promise.all([api('/media'+query+(all?'&include_hidden=true':'')), all ? api('/hidden'+query) : {groups:[]}]) : [[], {groups:[]}];
   if(version !== fetchVersion)return;
-  const signature = server + '\n' + JSON.stringify(result);
+  const signature = server + '\n' + JSON.stringify([result, hidden]);
   if(!force && signature === mediaSignature)return;
-  mediaSignature = signature; media = result; render();
+  mediaSignature = signature; media = result; hiddenGroups = new Set(hidden.groups.map(g=>groupKey(g.year,g.album))); render();
 }
 function thumb(item) {
   const cover = el('button',undefined,'cover'); cover.type='button';
@@ -37,11 +41,22 @@ function thumb(item) {
   else cover.append(el('span','プレビュー準備中','placeholder'));
   return cover;
 }
+// Admin-only eye toggle; `own` is this card's own flag (it may also be hidden via its year/album).
+function hideButton(label, own, path, body, cls = '') {
+  const b = el('button',undefined,'hide-button'+cls+(own?' is-hidden':'')); b.type='button';
+  b.title = own ? '表示する' : '非表示にする'; b.setAttribute('aria-label', label+'を'+b.title); b.setAttribute('aria-pressed', own);
+  b.onclick = action(async e => { e.stopPropagation(); await api(path, own ? 'DELETE' : 'PUT', body); await refresh(); });
+  return b;
+}
+function hiddenBadge(cover, cls) { cover.append(el('span','非表示','badge hidden-badge '+cls)); }
 function emptyState(title, text) {
   const box = el('div',undefined,'empty'); box.append(el('span',undefined,'empty-icon'),el('p',title,'empty-title'),el('p',text));
   box.firstChild.setAttribute('aria-hidden','true'); return box;
 }
 function render() {
+  // A folder that just became hidden (or vanished) is left for the nearest visible level.
+  if(year && !media.some(m=>m.year===year)){year=null;album=null;}
+  if(album && !media.some(m=>m.year===year&&m.album===album))album=null;
   const nav=$('breadcrumbs');nav.replaceChildren();
   const crumb=(text,fn,cls='crumb')=>{const b=el('button',text,cls);b.type='button';b.onclick=fn;nav.append(b);return b;};
   const sep=()=>{const s=el('span','›','sep');s.setAttribute('aria-hidden','true');nav.append(s);};
@@ -61,24 +76,30 @@ function render() {
   if(!year || !album){const key=!year?'year':'album';const groups=Map.groupBy ? Map.groupBy(items,m=>m[key]) : items.reduce((map,m)=>map.set(m[key],[...(map.get(m[key])||[]),m]),new Map());
     grid.classList.add(key==='year'?'grid-years':'grid-albums');
     for(const [name,group] of groups){
-      const card=el('article',undefined,'card group'+(group.some(m=>m.id===playingId)?' playing':'')), cover=thumb(group.find(m=>m.thumbnail)||group[0]);
+      const own=hiddenGroups.has(key==='year'?groupKey(name):groupKey(year,name)), dim=own||group.every(m=>m.hidden_effective);
+      const card=el('article',undefined,'card group'+(group.some(m=>m.id===playingId)?' playing':'')+(dim?' is-hidden':'')), cover=thumb(group.find(m=>m.thumbnail)||group[0]);
       cover.setAttribute('aria-label',name+'を開く');cover.onclick=()=>{if(!year)year=name;else album=name;render();};
+      if(dim)hiddenBadge(cover,'top');
       const body=el('div',undefined,'card-body');body.append(el('h3',name),el('p',group.length+' 本','meta'));
-      card.append(cover,body);grid.append(card);}
+      card.append(cover,body);
+      if(isAdmin())card.append(hideButton(name,own,'/servers/'+enc($('server').value)+'/hidden',key==='year'?{year:name}:{year,album:name},' overlay'));
+      grid.append(card);}
     return;}
   for(const item of items){
-    const playing=item.id===playingId, card=el('article',undefined,'card'+(playing?' playing':'')), cover=thumb(item), r=item.resources[0];
+    const playing=item.id===playingId, card=el('article',undefined,'card'+(playing?' playing':'')+(item.hidden_effective?' is-hidden':'')), cover=thumb(item), r=item.resources[0];
     cover.setAttribute('aria-label',item.title+'を再生');cover.onclick=action(()=>start(item.id,items));
     const duration=(r?.duration||'').split('.')[0];
     if(duration)cover.append(el('span',duration,'badge duration'));
     if(playing)cover.append(el('span','再生中','badge now-badge'));
+    if(item.hidden_effective)hiddenBadge(cover,'bottom');
     const body=el('div',undefined,'card-body'), heading=el('div',undefined,'title-row');heading.append(el('h3',item.title));body.append(heading);
     if(r)body.append(el('p',[r.resolution,r.mime,duration].filter(Boolean).join(' / '),'meta'));
     if(item.custom_title)body.append(el('p',item.source_title,'meta source'));
     if(item.thumb_error)body.append(el('p','サムネイル生成失敗。再クロールで再試行します。','warn'));
-    const edit=el('button',undefined,'edit-button');edit.type='button';edit.title='タイトルを編集';edit.setAttribute('aria-label',item.title+'のタイトルを編集');
-    edit.onclick=()=>{editId=item.id;$('original').textContent='元の名前: '+item.source_title;$('title').value=item.custom_title||'';$('edit').showModal();};
-    heading.append(edit);card.append(cover,body);grid.append(card);}
+    if(isAdmin()){const edit=el('button',undefined,'edit-button');edit.type='button';edit.title='タイトルを編集';edit.setAttribute('aria-label',item.title+'のタイトルを編集');
+      edit.onclick=()=>{editId=item.id;$('original').textContent='元の名前: '+item.source_title;$('title').value=item.custom_title||'';$('edit').showModal();};
+      heading.append(edit,hideButton(item.title,!!item.hidden,'/media/'+enc(item.id)+'/hidden'));}
+    card.append(cover,body);grid.append(card);}
 }
 async function stop(){ $('video').pause();$('video').hidden=true; if(activeRenderer)await api('/renderers/'+enc(activeRenderer)+'/stop','POST');activeRenderer='';playingId=null;$('now').textContent='停止';render(); }
 async function start(id,items){await stop();items=media.filter(m=>m.year===items.find(i=>i.id===id).year);queue=items;index=items.findIndex(m=>m.id===id);activeRenderer=$('renderer').value;
@@ -105,7 +126,13 @@ $('cancel').onclick=()=>$('edit').close();
 $('stop').onclick=action(stop);
 $('pause').onclick=action(async()=>{if(activeRenderer)await api('/renderers/'+enc(activeRenderer)+'/pause','POST');else $('video').pause();});
 $('play').onclick=action(async()=>{if(activeRenderer)await api('/renderers/'+enc(activeRenderer)+'/play','POST');else if($('video').src)await $('video').play();});
-$('login').onsubmit=action(async e=>{e.preventDefault();await api('/login','POST',{token:$('token').value});$('token').value='';$('login').hidden=true;await devices();});
+$('login').onsubmit=action(async e=>{e.preventDefault();await api('/login','POST',{token:$('token').value});$('token').value='';$('login').hidden=true;await boot();});
+$('logout').onclick=action(async()=>{await api('/logout','POST');location.reload();});
+$('show-hidden').onchange=action(()=>refresh());
+async function boot(){const me=await api('/me');role=me.role;
+  $('role').textContent=isAdmin()?'管理者':'ゲスト';$('role').dataset.role=role;$('account').hidden=false;$('logout').hidden=!me.auth;
+  $('show-hidden-wrap').hidden=!isAdmin();$('add').closest('details').hidden=!isAdmin();if(!isAdmin())$('show-hidden').checked=false;
+  await devices();await refresh();}
 const crawlLabels={idle:'待機',scanning:'動画を取得中',thumbnails:'サムネイル生成中',complete:'クロール完了',failed:'クロール失敗',interrupted:'中断'};
 const isRunning=state=>!!state&&['scanning','thumbnails'].includes(state.state);
 function showCrawl(state){const status=$('crawl-status'),button=$('crawl'),running=isRunning(state);
@@ -127,4 +154,4 @@ async function poll(){try{
   }catch(e){message(e.message);}finally{setTimeout(poll,2500);}}
 // Keep page content clear of the fixed player dock, whose height changes when the video is shown.
 if(window.ResizeObserver)new ResizeObserver(()=>document.documentElement.style.setProperty('--dock-h',$('player').offsetHeight+'px')).observe($('player'));
-action(devices)();poll();
+action(boot)();poll();

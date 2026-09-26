@@ -19,6 +19,12 @@ XML = '''<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:d
 <item id="a" parentID="0" restricted="1"><dc:title>20240102123456.mp4</dc:title><dc:date>2024-01-02</dc:date><upnp:album>2024-01 家族旅行</upnp:album><upnp:class>object.item.videoItem</upnp:class><res protocolInfo="http-get:*:video/mp4:*" duration="00:00:20" size="100" resolution="1920x1080">http://localhost/video.mp4?a=1&amp;b=2</res><res protocolInfo="http-get:*:video/vnd.dlna.mpeg-tts:*">http://localhost/video.m2ts</res></item></DIDL-Lite>'''
 
 
+@pytest.fixture(autouse=True)
+def no_tokens(monkeypatch):
+    for name in ("DLNA_TOKEN", "DLNA_ADMIN_TOKEN", "DLNA_GUEST_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def item():
     return parse_didl(XML, "fallback")[0]
 
@@ -149,7 +155,7 @@ def test_lan_client_requires_token(tmp_path, monkeypatch):
     lan = {"base_url": "http://192.168.1.10:8000", "client": ("192.168.1.20", 50000)}
     with TestClient(create_app(tmp_path), **lan) as client:
         response = client.get("/api/devices")
-        assert response.status_code == 403 and "DLNA_TOKEN" in response.json()["detail"]
+        assert response.status_code == 403 and "DLNA_ADMIN_TOKEN" in response.json()["detail"]
         assert client.post("/api/devices", headers=HEADERS, json={"url": "http://169.254.169.254/"}).status_code == 403
     with TestClient(create_app(tmp_path), base_url="http://localhost", client=("::1", 50000)) as client:
         assert client.get("/api/devices").status_code == 200
@@ -419,3 +425,139 @@ def test_cancel_stops_thumbnail_workers(tmp_path, monkeypatch):
         assert workers and all(w.done() for w in workers)
         assert [t for t in asyncio.all_tasks() if t is not asyncio.current_task()] == []
     asyncio.run(run())
+
+
+LAN = {"base_url": "http://192.168.1.10:8000", "client": ("192.168.1.20", 50000)}
+ADMIN, GUEST = {**HEADERS, "Authorization": "Bearer admin-secret"}, {**HEADERS, "Authorization": "Bearer guest-secret"}
+
+
+def role_app(tmp_path, monkeypatch, sources=("a",)):
+    monkeypatch.setenv("DLNA_ADMIN_TOKEN", "admin-secret")
+    monkeypatch.setenv("DLNA_GUEST_TOKEN", "guest-secret")
+    monkeypatch.setenv("DLNA_ALLOWED_HOSTS", "192.168.1.10")
+    net = Network()
+    net.command = AsyncMock(return_value={})
+    app = create_app(tmp_path, net)
+    app.state.catalog.device(SERVER)
+    app.state.catalog.device(RENDERER)
+    ids = [app.state.catalog.upsert(SERVER["id"], s) for s in items(*sources)]
+    return app, ids
+
+
+def test_roles_and_token_config(tmp_path, monkeypatch):
+    app, _ = role_app(tmp_path, monkeypatch)
+    with TestClient(app, **LAN) as client:
+        assert client.get("/api/me").status_code == 401
+        assert client.get("/api/me", headers={"Authorization": "Bearer wrong"}).status_code == 401
+        assert client.get("/api/me", headers=ADMIN).json() == {"role": "admin", "auth": True}
+        assert client.get("/api/me", headers=GUEST).json()["role"] == "guest"
+        assert client.post("/api/login", json={"token": "wrong"}).status_code == 401
+        assert client.post("/api/login", json={"token": "guest-secret"}).json() == {"role": "guest"}
+        assert client.get("/api/me").json()["role"] == "guest"
+        assert client.get("/api/me", headers=ADMIN).json()["role"] == "admin"
+        assert client.post("/api/login", json={"token": "admin-secret"}).json() == {"role": "admin"}
+        assert client.get("/api/me").json()["role"] == "admin"
+        assert client.post("/api/logout").status_code == 403  # CSRF header still required
+        assert client.post("/api/logout", headers=HEADERS).status_code == 200
+        assert client.get("/api/me").status_code == 401
+    # DLNA_TOKEN stays a working alias for the admin token.
+    monkeypatch.delenv("DLNA_ADMIN_TOKEN")
+    monkeypatch.setenv("DLNA_TOKEN", "admin-secret")
+    with TestClient(create_app(tmp_path), **LAN) as client:
+        assert client.get("/api/me", headers=ADMIN).json()["role"] == "admin"
+        assert client.get("/api/me", headers=GUEST).json()["role"] == "guest"
+    monkeypatch.setenv("DLNA_ADMIN_TOKEN", "admin-secret")
+    create_app(tmp_path)  # same value twice is fine
+    monkeypatch.setenv("DLNA_ADMIN_TOKEN", "other")
+    with pytest.raises(ValueError, match="DLNA_TOKEN"):
+        create_app(tmp_path)
+    monkeypatch.delenv("DLNA_TOKEN")
+    monkeypatch.setenv("DLNA_GUEST_TOKEN", "other")
+    with pytest.raises(ValueError, match="別の値"):
+        create_app(tmp_path)
+    monkeypatch.delenv("DLNA_ADMIN_TOKEN")
+    with pytest.raises(ValueError, match="DLNA_ADMIN_TOKEN"):
+        create_app(tmp_path)
+    monkeypatch.delenv("DLNA_GUEST_TOKEN")
+    with TestClient(create_app(tmp_path), **LOCAL) as client:  # no token: loopback is admin
+        assert client.get("/api/me").json() == {"role": "admin", "auth": False}
+
+
+def test_guest_permissions(tmp_path, monkeypatch):
+    app, (id,) = role_app(tmp_path, monkeypatch)
+    with TestClient(app, **LAN) as client:
+        for method, path, body in [("PUT", f"/api/media/{id}/hidden", None), ("DELETE", f"/api/media/{id}/hidden", None),
+                                   ("PUT", "/api/servers/uuid:server/hidden", {"year": "2024"}),
+                                   ("DELETE", "/api/servers/uuid:server/hidden", {"year": "2024"}),
+                                   ("PATCH", f"/api/media/{id}/title", {"title": "x"}),
+                                   ("POST", "/api/devices", {"url": "http://10.0.0.5/d.xml"})]:
+            response = client.request(method, path, headers=GUEST, json=body)
+            assert response.status_code == 403 and response.json()["detail"] == "管理者のみ操作できます", path
+        assert client.get("/api/hidden", params={"server_id": SERVER["id"]}, headers=GUEST).status_code == 403
+        assert client.get("/api/devices", headers=GUEST).status_code == 200
+        assert client.post("/api/renderers/uuid:tv/queue", headers=GUEST, json={"ids": [id]}).status_code == 200
+        assert client.post("/api/renderers/uuid:tv/stop", headers=GUEST).status_code == 200
+        assert client.patch(f"/api/media/{id}/title", headers=ADMIN, json={"title": "x"}).status_code == 200
+        assert client.put("/api/servers/uuid:server/hidden", headers=ADMIN, json={"year": "y" * 301}).status_code == 422
+
+
+def test_hidden_items_and_groups(tmp_path, monkeypatch):
+    sources = items("a", "b", "c")
+    sources[2]["album"] = "2024-02 別アルバム"
+    app, _ = role_app(tmp_path, monkeypatch, ())
+    db = app.state.catalog
+    a, b, c = (db.upsert(SERVER["id"], s) for s in sources)
+    params = {"server_id": SERVER["id"]}
+    def ids(headers, include_hidden=False):
+        rows = client.get("/api/media", params={**params, "include_hidden": include_hidden}, headers=headers).json()
+        return {r["id"]: r["hidden_effective"] for r in rows}
+    with TestClient(app, **LAN) as client:
+        assert client.put(f"/api/media/{a}/hidden", headers=ADMIN).json() == {"hidden": True}
+        assert client.put("/api/media/missing/hidden", headers=ADMIN).status_code == 404
+        assert ids(GUEST) == ids(GUEST, True) == ids(ADMIN) == {b: False, c: False}
+        assert ids(ADMIN, True) == {a: True, b: False, c: False}
+        # Album hide covers its items only; year hide covers every album.
+        album = {"year": "2024", "album": "2024-01 家族旅行"}
+        assert client.put("/api/servers/uuid:server/hidden", headers=ADMIN, json=album).status_code == 200
+        assert ids(GUEST) == {c: False} and ids(ADMIN, True) == {a: True, b: True, c: False}
+        assert client.put("/api/servers/uuid:server/hidden", headers=ADMIN, json={"year": "2024"}).status_code == 200
+        assert ids(GUEST) == {} and ids(GUEST, True) == {} and ids(ADMIN, True) == {a: True, b: True, c: True}
+        assert client.get("/api/hidden", params=params, headers=ADMIN).json() == {
+            "groups": [{"year": "2024", "album": ""}, album]}
+        assert client.post("/api/renderers/uuid:tv/queue", headers=GUEST, json={"ids": [c]}).status_code == 404
+        assert client.post("/api/renderers/uuid:tv/queue", headers=ADMIN, json={"ids": [c]}).status_code == 200
+        assert client.put("/api/servers/uuid:other/hidden", headers=ADMIN, json={"year": "2024"}).status_code == 404
+        # Unhide restores, layer by layer.
+        assert client.request("DELETE", "/api/servers/uuid:server/hidden", headers=ADMIN, json={"year": "2024"}).status_code == 200
+        assert ids(GUEST) == {c: False}
+        assert client.request("DELETE", "/api/servers/uuid:server/hidden", headers=ADMIN, json=album).status_code == 200
+        assert ids(GUEST) == {b: False, c: False}
+        assert client.delete(f"/api/media/{a}/hidden", headers=ADMIN).json() == {"hidden": False}
+        assert ids(GUEST) == {a: False, b: False, c: False}
+
+
+def test_hidden_flag_survives_crawl_and_migration(tmp_path, monkeypatch):
+    import sqlite3
+    old = tmp_path / "old"
+    old.mkdir()
+    with sqlite3.connect(old / "catalog.sqlite3") as conn:  # schema from before the hidden column
+        conn.execute("""CREATE TABLE media (id TEXT PRIMARY KEY, server_id TEXT NOT NULL, object_id TEXT NOT NULL,
+            source_title TEXT NOT NULL, custom_title TEXT, album TEXT NOT NULL, year TEXT NOT NULL, date TEXT,
+            resources TEXT NOT NULL, metadata TEXT NOT NULL, fingerprint TEXT NOT NULL, thumbnail TEXT, thumb_error TEXT,
+            available INTEGER NOT NULL DEFAULT 1, updated TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(server_id, object_id))""")
+        conn.execute("INSERT INTO media(id,server_id,object_id,source_title,album,year,resources,metadata,fingerprint)"
+                     " VALUES('x','s','o','t.mp4','al','2020','[]','','f')")
+    db = Catalog(old)
+    assert db.get("x")["hidden"] == 0 and db.get("x")["hidden_effective"] is False
+    db.hide("x", True)
+    assert Catalog(old).get("x")["hidden"] == 1
+    db = Catalog(tmp_path)
+    fake_thumbnails(monkeypatch, [])
+    crawl(db, FakeNetwork(items("a", "b")))
+    a = next(r["id"] for r in db.media(SERVER["id"]) if r["object_id"] == "a")
+    db.hide(a, True)
+    changed = items("a", "b")
+    changed[0]["title"] = "renamed.mp4"  # forces a rewrite of the row
+    crawl(db, FakeNetwork(changed))
+    assert db.get(a)["hidden"] == 1 and db.get(a)["source_title"] == "renamed.mp4"
+    assert [r["object_id"] for r in db.media(SERVER["id"], include_hidden=False)] == ["b"]
