@@ -22,8 +22,8 @@
     <section class="toolbar" aria-label="機器設定">
       <label class="field"><span class="field-label">MediaServer <span id="server-spinner" class="spinner" hidden title="取得中"></span></span>
         <select id="server"><option value="">選択してください</option></select></label>
-      <label class="field"><span class="field-label">再生先</span>
-        <select id="renderer"><option value="">ブラウザ（MP4）</option></select></label>
+      <label class="field"><span class="field-label" title="再生できない形式は自動でもう一方（ブラウザ／DLNA機器）で再生します">優先再生先</span>
+        <select id="renderer"><option value="">このブラウザ</option></select></label>
       <div class="toolbar-actions">
         <button id="discover" class="btn primary" type="button">機器を検索</button>
         <button id="crawl" class="btn" type="button">再クロール</button>
@@ -57,10 +57,9 @@
     <p>ライブラリを開くにはアクセストークンを入力してください。</p>
     <label class="field"><span class="field-label">アクセストークン</span>
       <input id="token" type="password" required autocomplete="current-password"></label>
+    <p id="login-error" class="login-error" role="alert"></p>
     <button class="btn primary">ログイン</button>
   </form>
-
-  <p id="message" class="notice" role="status"></p>
 
   <div class="browse-bar">
     <nav id="breadcrumbs" class="crumbs" aria-label="階層"></nav>
@@ -78,7 +77,7 @@
     <video id="video" controls hidden></video>
     <div class="now-wrap">
       <span class="now-art" aria-hidden="true"></span>
-      <div class="now-text"><span class="eyebrow">NOW PLAYING</span>
+      <div class="now-text"><span class="now-meta"><span class="eyebrow">NOW PLAYING</span><span id="now-target" class="now-target" hidden></span></span>
         <strong id="now">動画を選択してください</strong></div>
     </div>
     <div class="controls">
@@ -91,6 +90,8 @@
     </div>
   </div>
 </section>
+
+<div id="toasts" class="toasts"></div>
 
 <dialog id="edit">
   <form id="title-form">

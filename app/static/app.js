@@ -2,28 +2,67 @@
 const $ = id => document.getElementById(id);
 let media = [], year = null, album = null, editId = null, queue = [], index = 0, activeRenderer = '', playingId = null;
 let fetchVersion = 0, scanWasRunning = false, mediaSignature = '';
-let role = null, hiddenGroups = new Set();
+let role = null, hiddenGroups = new Set(), renderers = [];
+// Playback session: `session` changes whenever playback is (re)started or stopped, so stale async steps bail out.
+let session = 0, sessionPref = '', lastSkipped = 0, lastError = '';
+const localFailed = new Set();  // items this browser failed to decode at runtime
 const isAdmin = () => role === 'admin', showHidden = () => isAdmin() && $('show-hidden').checked;
 const groupKey = (y, a = '') => y + '\0' + a;
 const enc = encodeURIComponent;
 function el(tag, text, cls) { const n = document.createElement(tag); if(text !== undefined) n.textContent = text; if(cls)n.className = cls; return n; }
-function message(text, detail = '') { $('message').textContent = text; $('message').title = detail; }
+// ---------- Toasts: toast(text, {type: 'info'|'success'|'error', detail}) ----------
+const TOAST_MS = {info: 4000, success: 4000, error: 8000}, TOAST_MAX = 4, toasts = new Map();
+function dismissToast(node, now = false) {
+  const t = toasts.get(node); if(!t)return; clearTimeout(t.timer); toasts.delete(node);
+  if(now || matchMedia('(prefers-reduced-motion: reduce)').matches){node.remove();return;}
+  node.classList.add('leaving'); setTimeout(()=>node.remove(), 200);
+}
+function toast(text, {type = 'info', detail = ''} = {}) {
+  if(!text)return null;
+  const key = type+'\n'+text+'\n'+detail, last = [...toasts.keys()].at(-1);
+  if(last && last.dataset.key === key){const t=toasts.get(last);t.count++;t.badge.textContent='×'+t.count;t.badge.hidden=false;t.restart();return last;}
+  const node = el('div',undefined,'toast toast-'+type), body = el('div',undefined,'toast-body'), line = el('p',undefined,'toast-text');
+  const icon = el('span',undefined,'toast-icon'), badge = el('span','','toast-count'), close = el('button','×','toast-close');
+  node.dataset.key = key; node.setAttribute('role', type === 'error' ? 'alert' : 'status');
+  icon.setAttribute('aria-hidden','true'); badge.hidden = true; close.type = 'button'; close.setAttribute('aria-label','閉じる');
+  line.append(el('span',text),badge); body.append(line);
+  if(detail){const d=el('details',undefined,'toast-detail');d.append(el('summary','詳細'),el('pre',detail));body.append(d);}
+  node.append(icon,body,close);
+  const ms = TOAST_MS[type] || TOAST_MS.info;
+  // Hover or focus inside holds the timer; the remaining time resumes afterwards.
+  const t = {count:1, badge, left:ms, timer:null, since:0, hover:false, focus:false,
+    sync(){ if(this.hover || this.focus){ if(this.timer){clearTimeout(this.timer);this.timer=null;this.left-=Date.now()-this.since;} }
+      else if(!this.timer){this.since=Date.now();this.timer=setTimeout(()=>dismissToast(node),Math.max(this.left,1500));} },
+    restart(){clearTimeout(this.timer);this.timer=null;this.left=ms;this.sync();}};
+  node.onmouseenter=()=>{t.hover=true;t.sync();}; node.onmouseleave=()=>{t.hover=false;t.sync();};
+  node.addEventListener('focusin',()=>{t.focus=true;t.sync();});
+  node.addEventListener('focusout',e=>{if(!node.contains(e.relatedTarget)){t.focus=false;t.sync();}});
+  close.onclick=()=>dismissToast(node);
+  toasts.set(node,t); $('toasts').append(node); t.sync();
+  while(toasts.size > TOAST_MAX)dismissToast(toasts.keys().next().value, true);
+  return node;
+}
+function message(text, detail = '') { toast(text, {detail}); }
 async function api(path, method = 'GET', body) {
   const response = await fetch('/api' + path, {method, headers:{'Content-Type':'application/json','X-Requested-With':'dlna-library'},body:body === undefined ? undefined : JSON.stringify(body)});
-  const data = await response.json();
-  if (!response.ok) { if(response.status === 401)$('login').hidden = false; throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)); }
+  const data = await response.json().catch(()=>({detail: response.statusText || '通信エラー'}));
+  if (!response.ok) { if(response.status === 401)$('login').hidden = false;
+    const detail = data.detail, error = new Error(typeof detail === 'string' ? detail : typeof detail?.message === 'string' ? detail.message : JSON.stringify(detail));
+    error.status = response.status; error.code = detail?.code; throw error; }
   return data;
 }
-function action(fn) { return async (...args) => { try { message(''); await fn(...args); } catch(e){message(e.message);} }; }
+// 401 opens the login card instead of a toast.
+function action(fn) { return async (...args) => { try { await fn(...args); } catch(e){ if(e.status !== 401)toast(e.message, {type:'error', detail:e.detail}); } }; }
 const hasKind = (d, kind) => d.kind.split(',').includes(kind);
 async function devices() {
   const list = await api('/devices');
   for(const [id,kind] of [['server','server'],['renderer','renderer']]) {
     const select = $(id), previous = select.value;
-    select.replaceChildren(new Option(id === 'server' ? '選択してください' : 'ブラウザ（MP4）',''));
+    select.replaceChildren(new Option(id === 'server' ? '選択してください' : 'このブラウザ',''));
     list.filter(d=>hasKind(d,kind)).forEach(d=>select.add(new Option(d.name + (d.model ? ' · '+d.model : ''),d.id)));
     if([...select.options].some(o=>o.value===previous))select.value=previous;
   }
+  renderers = list.filter(d=>hasKind(d,'renderer'));
 }
 // Periodic refreshes skip re-rendering when nothing changed, so hover/scroll/focus survive.
 async function refresh(force = true) {
@@ -101,19 +140,110 @@ function render() {
       heading.append(edit,hideButton(item.title,!!item.hidden,'/media/'+enc(item.id)+'/hidden'));}
     card.append(cover,body);grid.append(card);}
 }
-async function stop(){ $('video').pause();$('video').hidden=true; if(activeRenderer)await api('/renderers/'+enc(activeRenderer)+'/stop','POST');activeRenderer='';playingId=null;$('now').textContent='停止';render(); }
-async function start(id,items){await stop();items=media.filter(m=>m.year===items.find(i=>i.id===id).year);queue=items;index=items.findIndex(m=>m.id===id);activeRenderer=$('renderer').value;
-  if(activeRenderer){const ids=items.slice(index).concat(items.slice(0,index)).map(m=>m.id);await api('/renderers/'+enc(activeRenderer)+'/queue','POST',{ids,repeat:$('repeat').checked});playingId=id;render();}
-  else await browserPlay();
+// ---------- Playback routing ----------
+// The 優先再生先 select is a preference: items this browser cannot play go to a DLNA renderer, and items the
+// renderer cannot play (or a failed push) come back to this browser. Every automatic reroute shows a toast.
+const savedRenderer={get(){try{return localStorage.getItem('dlna.renderer')||'';}catch{return '';}},set(v){try{localStorage.setItem('dlna.renderer',v);}catch{}}};
+const rendererName = id => renderers.find(r=>r.id===id)?.name || '再生先';
+const urlPath = r => { try { return new URL(r.url).pathname.toLowerCase(); } catch { return ''; } };
+const isMp4 = r => r.mime === 'video/mp4' || urlPath(r).endsWith('.mp4');
+// Best resource this browser says it can play ('probably'/'maybe'); MP4 first, as before.
+function localResource(item) {
+  if(!item || localFailed.has(item.id))return null;
+  const v = $('video'), types = r => [r.mime, urlPath(r).endsWith('.mp4') ? 'video/mp4' : ''].filter(Boolean);
+  const ok = item.resources.filter(r=>types(r).some(t=>v.canPlayType(t)));
+  return ok.find(isMp4) || ok[0] || null;
 }
-async function browserPlay(){const item=queue[index];if(!item)return;const r=item.resources.find(r=>r.mime==='video/mp4'||new URL(r.url).pathname.toLowerCase().endsWith('.mp4'));
-  if(!r)throw new Error('この動画にはMP4リソースがありません。再生先にDLNA機器を選んでください。');
-  const v=$('video');v.src=r.url;v.hidden=false;playingId=item.id;$('now').textContent=item.title+' ('+(index+1)+'/'+queue.length+')';render();await v.play();}
-$('video').onended=action(async()=>{index++;if(index>=queue.length){if(!$('repeat').checked){await stop();return;}index=0;}await browserPlay();});
-$('video').onerror=()=>message('ブラウザで再生できません。動画形式・MediaServerへの接続を確認するか、DLNA機器を選んでください。');
+async function canPlay(rid, item) { return (await api('/renderers/'+enc(rid)+'/plan','POST',{ids:[item.id]}))[0].playable; }
+// For items this browser cannot play. Order: the session's preferred renderer, the last one chosen explicitly, then
+// the rest. Renderers that know the item is incompatible are passed over (null = did not say: try it), and a failed
+// push moves on to the next one. Throws when none could take it.
+async function pushFallback(item, token, first, reason) {
+  const saved = savedRenderer.get(), rank = r => r.id === sessionPref ? 0 : r.id === saved ? 1 : 2, failures = [];
+  for(const r of [...renderers].sort((a,b)=>rank(a)-rank(b))){
+    try { if(await canPlay(r.id,item) === false)continue; } catch(e) { failures.push(r.name+': '+e.message); continue; }
+    if(token !== session)return;
+    try { await push(r.id, token, first); } catch(e) { if(!e.code)throw e; failures.push(e.message); continue; }
+    toast(reason+'ため、'+r.name+'で再生します', {detail: failures.join('\n')});
+    return;
+  }
+  const error = new Error(unplayableAnywhere(item)); error.detail = failures.join('\n'); throw error;
+}
+function setTarget(label) { $('now-target').textContent = label; $('now-target').hidden = !label; }
+function stopBrowser() { const v=$('video'); v.pause(); v.removeAttribute('src'); v.load(); v.hidden=true; }
+async function stop(){ session++; stopBrowser();
+  try { if(activeRenderer)await api('/renderers/'+enc(activeRenderer)+'/stop','POST'); }
+  finally { activeRenderer='';playingId=null;$('now').textContent='停止';setTarget('');render(); } }
+async function start(id,items){ await stop().catch(()=>{});
+  queue=media.filter(m=>m.year===items.find(i=>i.id===id).year);index=queue.findIndex(m=>m.id===id);sessionPref=$('renderer').value;
+  await route(session, true); }
+const unplayableAnywhere = item => '「'+item.title+'」はこのブラウザで再生できない形式で、再生できるDLNA機器も見つかりません。';
+// Routes queue[index]. `first`: the user's own click (a renderer then gets the whole rotated year queue).
+async function route(token, first = false) {
+  const item = queue[index]; if(!item || token !== session)return;
+  if(!sessionPref){
+    if(localResource(item))return browserPlay(token);
+    return pushFallback(item, token, first, item.resources.some(isMp4) ? 'このブラウザで再生できない形式の' : 'MP4がない');
+  }
+  const name = rendererName(sessionPref), playable = await canPlay(sessionPref, item); if(token !== session)return;
+  if(playable === false)
+    return toBrowser(token, name+'が対応していない形式のため、このブラウザで再生します', name+'が対応していない形式で、このブラウザでも再生できません。');
+  try { await push(sessionPref, token, first); }
+  catch(e) { if(!e.code || token !== session)throw e;  // push_failed / unplayable: the renderer could not start it
+    await toBrowser(token, name+'で再生できなかったため、このブラウザで再生します', e.message+'（このブラウザでも再生できない形式です）'); }
+}
+async function toBrowser(token, info, error) { if(!localResource(queue[index]))throw new Error(error); toast(info); await browserPlay(token); }
+// Hands the queue from `index` to a renderer; the server advances it from there (no hand-back to the browser).
+async function push(rid, token, first) {
+  const rest = queue.slice(index), ids = (first || $('repeat').checked ? rest.concat(queue.slice(0,index)) : rest).map(m=>m.id);
+  stopBrowser();
+  await api('/renderers/'+enc(rid)+'/queue','POST',{ids,repeat:$('repeat').checked});
+  if(token !== session)return;
+  activeRenderer=rid;playingId=queue[index].id;lastSkipped=0;lastError='';
+  setTarget(rendererName(rid));$('now').textContent=queue[index].title;render();
+}
+async function browserPlay(token){const item=queue[index],r=localResource(item);if(!r||token!==session)return;
+  activeRenderer='';const v=$('video');v.src=r.url;v.hidden=false;playingId=item.id;setTarget('このブラウザ');
+  $('now').textContent=item.title+' ('+(index+1)+'/'+queue.length+')';render();
+  try{await v.play();}catch(e){if(e.name!=='NotSupportedError'&&e.name!=='AbortError')throw e;}}  // unsupported: see onerror
+// Next item of a browser session; an item nobody can play is reported and passed over.
+async function advance(token){
+  for(let tries=0;tries<queue.length&&token===session;tries++){
+    index++;if(index>=queue.length){if(!$('repeat').checked){await stop();return;}index=0;}
+    try{await route(token);return;}catch(e){if(e.status===401)throw e;toast(e.message,{type:'error',detail:e.detail});}
+  }
+  if(token===session)await stop();
+}
+$('video').onended=action(()=>advance(session));
+$('video').onerror=action(async()=>{const v=$('video'),code=v.error?.code,token=session,item=queue[index];
+  if(!v.getAttribute('src')||activeRenderer||!item||item.id!==playingId)return;
+  if(code!==MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED&&code!==MediaError.MEDIA_ERR_DECODE)
+    throw new Error('ブラウザで再生できません。MediaServerへの接続を確認してください。');
+  // e.g. HEVC in an MP4 the browser cannot decode: never try it here again, send it to a renderer.
+  localFailed.add(item.id);stopBrowser();
+  try{await pushFallback(item,token,false,'このブラウザで再生できない形式の');}
+  catch(e){if(token===session){playingId=null;setTarget('');$('now').textContent='停止';render();}throw e;}});
+$('renderer').onchange=()=>{if($('renderer').value)savedRenderer.set($('renderer').value);};
+// Renderer session: follow the server-side queue; the item the user picked failing to start falls back here.
+async function rendererState(rid, state, token){
+  const name=rendererName(rid);
+  $('now').textContent=[state.title,state.state,state.position+'/'+state.duration].filter(Boolean).join(' · ');
+  if((state.skipped||0)>lastSkipped)toast(name+'で再生できない動画を '+(state.skipped-lastSkipped)+' 本スキップしました');
+  lastSkipped=state.skipped||0;
+  if(state.media_id&&playingId!==state.media_id){playingId=state.media_id;const i=queue.findIndex(m=>m.id===playingId);if(i>=0)index=i;render();}
+  if(state.state!=='ERROR'||!state.error||state.error===lastError)return;
+  lastError=state.error;
+  const i=queue.findIndex(m=>m.id===state.media_id);
+  if(state.failure==='unplayable'&&i>=0){index=i;activeRenderer='';
+    if(localResource(queue[i])){toast(name+'で再生できなかったため、このブラウザで再生します');await browserPlay(token);return;}
+    playingId=null;setTarget('');$('now').textContent='停止';render();
+    throw new Error(name+'で再生できず、このブラウザでも再生できない形式です。');}
+  toast(state.error,{type:'error'});
+}
 $('discover').onclick=action(async()=>{$('discover').disabled=true;try{const result=await api('/discover','POST');await devices();
   const count=kind=>result.devices.filter(d=>hasKind(d,kind)).length;
-  message('MediaServer '+count('server')+' 台・再生先 '+count('renderer')+' 台を検出'+(result.errors.length?'（一部の機器情報を取得できませんでした）':''),result.errors.map(String).join('\n'));
+  toast('MediaServer '+count('server')+' 台・再生先 '+count('renderer')+' 台を検出'+(result.errors.length?'（一部の機器情報を取得できませんでした）':''),
+    {type:result.errors.length?'info':'success',detail:result.errors.map(String).join('\n')});
 }finally{$('discover').disabled=false;}});
 $('add').onsubmit=action(async e=>{e.preventDefault();await api('/devices','POST',{url:$('location').value});await devices();});
 // Starting is idempotent on the server: a running crawl is joined, never duplicated or cancelled.
@@ -157,7 +287,9 @@ $('cancel').onclick=()=>$('edit').close();
 $('stop').onclick=action(stop);
 $('pause').onclick=action(async()=>{if(activeRenderer)await api('/renderers/'+enc(activeRenderer)+'/pause','POST');else $('video').pause();});
 $('play').onclick=action(async()=>{if(activeRenderer)await api('/renderers/'+enc(activeRenderer)+'/play','POST');else if($('video').src)await $('video').play();});
-$('login').onsubmit=action(async e=>{e.preventDefault();await api('/login','POST',{token:$('token').value});$('token').value='';$('login').hidden=true;await boot();});
+$('login').onsubmit=async e=>{e.preventDefault();$('login-error').textContent='';
+  try{await api('/login','POST',{token:$('token').value});}catch(err){$('login-error').textContent=err.message;return;}
+  $('token').value='';$('login').hidden=true;await action(boot)();};
 $('logout').onclick=action(async()=>{await api('/logout','POST');location.reload();});
 $('show-hidden').onchange=action(()=>refresh());
 async function boot(){const me=await api('/me');role=me.role;
@@ -182,8 +314,9 @@ async function poll(){try{
   if(server){const state=await api('/servers/'+enc(server)+'/crawl');
     if(server===$('server').value){showCrawl(state);const running=isRunning(state);if(running||scanWasRunning)await refresh(false);scanWasRunning=running;}}
   else showCrawl(null);
-  if(activeRenderer){const state=await api('/renderers/'+enc(activeRenderer)+'/state');$('now').textContent=[state.title,state.state,state.position+'/'+state.duration,state.error].filter(Boolean).join(' · ');if(playingId!==state.media_id){playingId=state.media_id;render();}}
-  }catch(e){message(e.message);}finally{setTimeout(poll,2500);}}
+  if(activeRenderer){const rid=activeRenderer,token=session,state=await api('/renderers/'+enc(rid)+'/state');
+    if(rid===activeRenderer&&token===session)await rendererState(rid,state,token);}
+  }catch(e){if(e.status!==401)toast(e.message,{type:'error'});}finally{setTimeout(poll,2500);}}
 // Keep page content clear of the fixed player dock, whose height changes when the video is shown.
-if(window.ResizeObserver)new ResizeObserver(()=>document.documentElement.style.setProperty('--dock-h',$('player').offsetHeight+'px')).observe($('player'));
+if(window.ResizeObserver)new ResizeObserver(()=>document.documentElement.style.setProperty('--dock-h',$('player').offsetHeight+'px')).observe($('player'),{box:'border-box'});
 action(boot)();poll();

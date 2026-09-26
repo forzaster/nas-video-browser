@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .catalog import Catalog
-from .jobs import Crawler, Player
+from .jobs import Crawler, Player, Unplayable
 from .upnp import Network
 
 log = logging.getLogger(__name__)
@@ -81,8 +81,11 @@ class CrawlRoot(BaseModel):
     title: str | None = Field(None, max_length=300)
 
 
-class Queue(BaseModel):
+class Plan(BaseModel):
     ids: list[str] = Field(min_length=1, max_length=10000)
+
+
+class Queue(Plan):
     repeat: bool = True
 
 
@@ -310,16 +313,33 @@ def create_app(directory=None, network=None):
         catalog.title(id, body.title)
         return {"title": catalog.get(id)["title"]}
 
-    @app.post("/api/renderers/{id}/queue")
-    async def queue(request: Request, id: str, body: Queue):
-        for media_id in body.ids:
+    def playable_ids(request, ids):
+        for media_id in ids:
             item = catalog.get(media_id)
             if not item or not item["available"] or (item["hidden_effective"] and request.state.role != "admin"):
                 raise HTTPException(404, "動画が見つかりません")
+
+    @app.post("/api/renderers/{id}/plan")
+    async def plan(request: Request, id: str, body: Plan):
+        """Per item: playable true / false (known incompatible) / null (renderer did not say). Read-only."""
+        playable_ids(request, body.ids)
+        return await player.plan(device(id, "renderer"), body.ids)
+
+    @app.post("/api/renderers/{id}/queue")
+    async def queue(request: Request, id: str, body: Queue):
+        playable_ids(request, body.ids)
+        renderer = device(id, "renderer")
         try:
-            return await player.start(device(id, "renderer"), body.ids, body.repeat)
+            return await player.start(renderer, body.ids, body.repeat)
+        except Unplayable as error:
+            raise HTTPException(422, {"message": str(error), "code": error.code})
         except ValueError as error:  # app-authored Japanese messages (missing media/service)
-            raise HTTPException(422, str(error))
+            raise HTTPException(422, {"message": str(error), "code": "push_failed"})
+        except Exception:  # device unreachable or refused: the client may fall back to the browser
+            log.exception("queue push failed: %s", renderer["name"])
+            code = player.states.get(id, {}).get("failure") or "push_failed"
+            text = "対応していない形式のため再生できませんでした" if code == "unplayable" else "機器に接続できませんでした"
+            raise HTTPException(502, {"message": f"{renderer['name']}: {text}", "code": code})
 
     @app.post("/api/renderers/{id}/{action}")
     async def control(id: str, action: str):
