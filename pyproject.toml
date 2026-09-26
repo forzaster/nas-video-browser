@@ -1,0 +1,11 @@
+[project]
+name = "dlna-video-library"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["fastapi==0.141.1", "uvicorn==0.54.0", "async-upnp-client==0.48.2", "defusedxml==0.7.1"]
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "httpx==0.28.1"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

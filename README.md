@@ -43,6 +43,42 @@ SQLiteには機器、元タイトル、追加タイトル、年、アルバム�
 ## LANから使う場合
 
 環境変数 `DLNA_TOKEN` に自分で決めた長いアクセストークンを設定し、`--host 0.0.0.0`で起動します。
+`DLNA_TOKEN` 未設定の場合、ループバック（127.0.0.1 / ::1）以外からの接続は403で拒否します。LANから使うにはトークンが必須です。
+ブラウザで開くときのホスト名は `localhost` / `127.0.0.1` / `[::1]` だけが許可されます（DNSリバインディング対策）。
+LANの別端末から開く場合は、そのURLに使うMacのIPアドレスやホスト名を `DLNA_ALLOWED_HOSTS` にカンマ区切りで指定します（例: `DLNA_ALLOWED_HOSTS=192.168.1.10,my-mac.local`、ポートは不要）。
+接続元IPを絞る場合は `DLNA_ALLOWED_CLIENTS` にIP/CIDRをカンマ区切りで指定し、`!` を付けたものは除外します（例: `DLNA_ALLOWED_CLIENTS=192.168.1.0/24,!192.168.1.1`）。ループバックは常に許可され、トークンも引き続き必要です。
+ルーターのLAN側アドレスを除外するのは、ポート転送・VPN・ヘアピンNATの通信がルーターのIPから来たように見え、外部からの接続がLAN内扱いになるのを防ぐためです。不正な指定があると起動時にエラーになります。
+
+起動例（MacのmDNSホスト名が `mymac.local`、LANが `192.168.1.0/24`、ルーターが `192.168.1.1` の場合）:
+
+```bash
+DLNA_TOKEN="自分で決めた長いトークン" \
+DLNA_ALLOWED_HOSTS="mymac.local" \
+DLNA_ALLOWED_CLIENTS='192.168.1.0/24,!192.168.1.1' \
+uv run uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8765
+```
+
+LAN内の端末から http://mymac.local:8765 を開きます。`!` はbash/zshの履歴展開と衝突するため（ダブルクォート内でも展開されます）、`DLNA_ALLOWED_CLIENTS` の値はシングルクォートで囲んでください。
+
+同じことを `launch.sh` で行えます（`-name` 省略時はMacのローカルホスト名、`-allowip` 省略時はLANサブネットを許可してルーターを除外、`-token` 省略時は入力を求めます）:
+
+```bash
+./launch.sh -name mymac -allowip '192.168.1.0/24,!192.168.1.1'
+```
+
+手動で指定する場合、全インターフェース（`0.0.0.0`）ではなくLAN側IPだけで待ち受けるには、デフォルトルートのインターフェースからIPを取得して指定します:
+
+```bash
+LAN_IP=$(ipconfig getifaddr "$(route -n get default | awk '/interface:/{print $2}')") && echo "LAN IP: $LAN_IP" && \
+DLNA_TOKEN="自分で決めた長いトークン" \
+DLNA_ALLOWED_HOSTS="$LAN_IP,mymac.local" \
+DLNA_ALLOWED_CLIENTS='192.168.1.0/24,!192.168.1.1' \
+DLNA_INTERFACE="$LAN_IP" \
+uv run uvicorn app.main:create_app --factory --host "$LAN_IP" --port 8765
+```
+
+この場合 `localhost` では開けないため、Mac自身からも http://mymac.local:8765 などで開きます（Mac自身の接続もLAN IPからの扱いになり、ログインが必要です）。
+VPN接続中はデフォルトルートがVPN側になり、IPが取得できないか意図しないアドレスになることがあります。DHCPでIPが変わると再起動が必要なので、ルーターでIPを固定しておくと安心です。
 ブラウザのログインフォームに同じトークンを入力してください。これは家庭内LAN向けです。インターネットへ直接公開する構成ではありません。
 SSDPの送信インターフェースを固定する場合は `DLNA_INTERFACE` にMacのLAN側IPv4アドレスを指定します。
 `FFMPEG` / `FFPROBE`で実行ファイルのパスを指定できます。
