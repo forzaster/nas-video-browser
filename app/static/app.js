@@ -118,9 +118,37 @@ $('discover').onclick=action(async()=>{$('discover').disabled=true;try{const res
 $('add').onsubmit=action(async e=>{e.preventDefault();await api('/devices','POST',{url:$('location').value});await devices();});
 // Starting is idempotent on the server: a running crawl is joined, never duplicated or cancelled.
 // Switching servers only changes what is displayed; other crawls keep running in the background.
-async function startCrawl(){const server=$('server').value;const state=await api('/servers/'+enc(server)+'/crawl','POST');if(server===$('server').value){showCrawl(state);scanWasRunning=true;}}
+async function startCrawl(){const server=$('server').value;const state=await api('/servers/'+enc(server)+'/crawl','POST');if(server===$('server').value){showCrawl(state);scanWasRunning=true;}return state;}
 $('server').onchange=action(async()=>{year=null;album=null;showCrawl(null);await refresh();if($('server').value)await startCrawl();});
 $('crawl').onclick=action(async()=>{if(!$('server').value)throw new Error('MediaServerを選択してください');await startCrawl();});
+// Admin-only source-folder picker: browse containers, then pin one (or return to auto-detection).
+let rootPath = [], rootVersion = 0;
+const rootLabel = r => (r.auto ? '自動: ' : '手動: ') + r.title;
+async function loadRoot(){const server=$('server').value, here=rootPath.at(-1), nav=$('root-path'), list=$('root-list'), version=++rootVersion;
+  nav.replaceChildren();
+  rootPath.forEach((p,i)=>{if(i){const s=el('span','›','sep');s.setAttribute('aria-hidden','true');nav.append(s);}
+    const b=el('button',p.title,'crumb'+(i?'':' home'));b.type='button';if(i===rootPath.length-1)b.setAttribute('aria-current','page');
+    b.onclick=()=>{rootPath=rootPath.slice(0,i+1);loadRoot();};nav.append(b);});
+  $('root-choose').textContent=rootPath.length>1?'このフォルダから取得':'ルート全体から取得';
+  list.replaceChildren(el('li','読み込み中…','root-empty'));list.setAttribute('aria-busy','true');
+  try{const children=await api('/servers/'+enc(server)+'/containers?parent='+enc(here.id));
+    if(version!==rootVersion)return;
+    list.replaceChildren(...children.map(c=>{const li=el('li'),b=el('button',undefined,'root-item');b.type='button';
+      b.append(el('span',c.title,'root-title'),el('span',c.child_count==null?'':c.child_count+' 件','root-count'));
+      b.onclick=()=>{rootPath.push({id:c.id,title:c.title});loadRoot();};li.append(b);return li;}));
+    if(!children.length)list.append(el('li','サブフォルダはありません','root-empty'));
+  }catch(e){if(version===rootVersion)list.replaceChildren(el('li',e.message,'root-empty warn'));}
+  finally{if(version===rootVersion)list.setAttribute('aria-busy','false');}}
+async function saveRoot(body){const server=$('server').value;await api('/servers/'+enc(server)+'/crawl-root','PUT',body);$('root-dialog').close();
+  const state=await startCrawl();
+  if(state&&state.root&&(body.id?state.root.id!==body.id||state.root.auto:!state.root.auto))message('実行中のクロールが終わった後に「再クロール」すると、新しい取得元が使われます。');}
+$('root-open').onclick=action(async()=>{const server=$('server').value;if(!server)throw new Error('MediaServerを選択してください');
+  const info=await api('/servers/'+enc(server)+'/crawl-root');
+  $('root-mode').textContent='現在の設定 — '+(info.id?rootLabel({auto:false,title:info.title}):info.last?.auto?rootLabel(info.last):'自動（次回のクロールで判定）');
+  $('root-auto').disabled=!info.id;rootPath=[{id:'0',title:'ルート'}];$('root-dialog').showModal();await loadRoot();});
+$('root-choose').onclick=action(()=>{const here=rootPath.at(-1);return saveRoot({id:here.id,title:rootPath.length>1?here.title:'ルート（すべて）'});});
+$('root-auto').onclick=action(()=>saveRoot({id:null}));
+$('root-cancel').onclick=()=>{rootVersion++;$('root-dialog').close();};
 $('title-form').onsubmit=action(async e=>{e.preventDefault();await api('/media/'+editId+'/title','PATCH',{title:$('title').value});$('edit').close();await refresh();});
 $('cancel').onclick=()=>$('edit').close();
 $('stop').onclick=action(stop);
@@ -131,7 +159,7 @@ $('logout').onclick=action(async()=>{await api('/logout','POST');location.reload
 $('show-hidden').onchange=action(()=>refresh());
 async function boot(){const me=await api('/me');role=me.role;
   $('role').textContent=isAdmin()?'管理者':'ゲスト';$('role').dataset.role=role;$('account').hidden=false;$('logout').hidden=!me.auth;
-  $('show-hidden-wrap').hidden=!isAdmin();$('add').closest('details').hidden=!isAdmin();if(!isAdmin())$('show-hidden').checked=false;
+  $('show-hidden-wrap').hidden=!isAdmin();$('root-open').hidden=!isAdmin();$('add').closest('details').hidden=!isAdmin();if(!isAdmin())$('show-hidden').checked=false;
   await devices();await refresh();}
 const crawlLabels={idle:'待機',scanning:'動画を取得中',thumbnails:'サムネイル生成中',complete:'クロール完了',failed:'クロール失敗',interrupted:'中断'};
 const isRunning=state=>!!state&&['scanning','thumbnails'].includes(state.state);
@@ -140,7 +168,7 @@ function showCrawl(state){const status=$('crawl-status'),button=$('crawl'),runni
     if(state.count)parts[1]+='（新規 '+state.new+(state.updated?'・更新 '+state.updated:'')+'・既存 '+state.skipped+'）';
     if(state.thumbs_total)parts.push('サムネイル '+state.thumbnails+'/'+state.thumbs_total);
     if(state.errors.length)parts.push('エラー '+state.errors.length+' 件');
-    status.textContent=parts.join(' · ');status.title=state.errors.join('\n');status.dataset.state=state.state;}
+    status.textContent=parts.join(' · ');status.title=[isAdmin()&&state.root?'取得元 '+rootLabel(state.root):'',...state.errors].filter(Boolean).join('\n');status.dataset.state=state.state;}
   else{status.textContent='';status.title='';delete status.dataset.state;}
   status.setAttribute('aria-busy',running);$('server-spinner').hidden=!running;
   button.textContent=running?'取得中…':'再クロール';button.classList.toggle('busy',running);button.setAttribute('aria-busy',running);

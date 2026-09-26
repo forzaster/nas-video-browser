@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -74,6 +74,11 @@ class Title(BaseModel):
 class Group(BaseModel):
     year: str = Field(min_length=1, max_length=300)
     album: str = Field("", max_length=1000)  # "" = the whole year
+
+
+class CrawlRoot(BaseModel):
+    id: str | None = Field(None, min_length=1, max_length=1024)  # None = auto-detect
+    title: str | None = Field(None, max_length=300)
 
 
 class Queue(BaseModel):
@@ -241,6 +246,24 @@ def create_app(directory=None, network=None):
     def crawl_state(id: str):
         device(id, "server")
         return crawler.state(id)
+
+    @app.get("/api/servers/{id}/containers", dependencies=[Depends(require_admin)])
+    async def containers(id: str, parent: str = Query("0", min_length=1, max_length=1024)):
+        try:
+            return await network.containers(device(id, "server"), parent)
+        except ValueError as error:  # app-authored (missing service)
+            raise HTTPException(422, str(error))
+
+    @app.get("/api/servers/{id}/crawl-root", dependencies=[Depends(require_admin)])
+    def crawl_root(id: str):
+        value = device(id, "server")
+        return {"id": value["crawl_root"], "title": value["crawl_root_title"], "last": crawler.state(id)["root"]}
+
+    @app.put("/api/servers/{id}/crawl-root", dependencies=[Depends(require_admin)])
+    def set_crawl_root(id: str, body: CrawlRoot):
+        device(id, "server")
+        catalog.crawl_root(id, body.id, body.title and body.title.strip())
+        return crawl_root(id)
 
     @app.get("/api/media")
     def media(request: Request, server_id: str, year: str | None = None, album: str | None = None,

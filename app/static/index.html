@@ -27,6 +27,7 @@
       <div class="toolbar-actions">
         <button id="discover" class="btn primary" type="button">機器を検索</button>
         <button id="crawl" class="btn" type="button">再クロール</button>
+        <button id="root-open" class="btn icon-btn settings-button" type="button" title="取得元フォルダ" aria-label="取得元フォルダ" hidden></button>
         <details class="add-device">
           <summary class="btn ghost">機器URLを指定</summary>
           <form id="add" class="popover">
@@ -102,6 +103,21 @@
       <button class="btn primary">保存</button>
     </div>
   </form>
+</dialog>
+
+<dialog id="root-dialog" aria-labelledby="root-heading">
+  <div class="root-panel">
+    <h2 id="root-heading">取得元フォルダ</h2>
+    <p id="root-mode" class="dialog-original"></p>
+    <nav id="root-path" class="root-path" aria-label="フォルダの階層"></nav>
+    <ul id="root-list" class="root-list" aria-live="polite"></ul>
+    <p class="dialog-hint">自動では「ビデオ」内の「全てのビデオ」やフォルダー表示を選びます。フォルダを開いて「このフォルダから取得」を押すと、その中（サブフォルダを含む）だけをクロールします。</p>
+    <div class="dialog-actions">
+      <button type="button" id="root-auto" class="btn ghost root-auto">自動に戻す</button>
+      <button type="button" id="root-cancel" class="btn ghost">キャンセル</button>
+      <button type="button" id="root-choose" class="btn primary">このフォルダから取得</button>
+    </div>
+  </div>
 </dialog>
 </body>
 </html>

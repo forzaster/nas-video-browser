@@ -6,6 +6,8 @@ from pathlib import Path
 
 from .upnp import preferred
 
+NOTHING_FOUND = "動画が見つかりませんでした。取得元フォルダを確認してください"
+
 log = logging.getLogger(__name__)
 
 
@@ -82,7 +84,8 @@ async def make_thumbnail(catalog, item):
 
 def crawl_status(state="idle"):
     # count=found, new/updated/skipped=DB rows, thumbnails=generated of thumbs_total queued, thumbs_skipped=cached
-    return {"state": state, "count": 0, "new": 0, "updated": 0, "skipped": 0,
+    # root={"id","title","auto"}: the container this crawl walked (None until chosen)
+    return {"state": state, "root": None, "count": 0, "new": 0, "updated": 0, "skipped": 0,
             "thumbnails": 0, "thumbs_total": 0, "thumbs_skipped": 0, "errors": []}
 
 
@@ -125,7 +128,14 @@ class Crawler:
         queue, ids = asyncio.Queue(), set()
         workers = [asyncio.create_task(self.thumbnailer(queue, status)) for _ in range(self.workers)]
         try:
-            async for item in self.network.items(device):
+            if device.get("crawl_root"):  # admin-chosen container, used as-is
+                root = {"id": device["crawl_root"], "title": device.get("crawl_root_title") or device["crawl_root"], "auto": False}
+                parent = root["title"]
+            else:  # auto: re-detected each crawl (a few Browse calls)
+                root = {**await self.network.detect_root(device), "auto": True}
+                parent = "未分類"
+            status["root"] = root
+            async for item in self.network.items(device, root["id"], parent):
                 row = self.catalog.sync(device["id"], item)
                 if row["id"] in ids:
                     continue
@@ -141,6 +151,8 @@ class Crawler:
                 if row["thumbnail"] != filename:
                     self.catalog.thumbnail(row["id"], row["fingerprint"], filename)
                 status["thumbs_skipped"] += 1
+            if not ids:  # a wrong/empty root must not mark the whole library unavailable
+                raise ValueError(NOTHING_FOUND)
             # Only after the entire tree succeeded. Failed crawls never hide existing media.
             self.catalog.finish_scan(device["id"], ids)
             status["state"] = "thumbnails"

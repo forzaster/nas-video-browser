@@ -43,7 +43,8 @@ class Catalog:
                 PRAGMA journal_mode=WAL;
                 CREATE TABLE IF NOT EXISTS devices (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, location TEXT NOT NULL,
-                    kind TEXT NOT NULL, model TEXT, seen TEXT DEFAULT CURRENT_TIMESTAMP
+                    kind TEXT NOT NULL, model TEXT, seen TEXT DEFAULT CURRENT_TIMESTAMP,
+                    crawl_root TEXT, crawl_root_title TEXT  -- NULL = auto-detect at each crawl
                 );
                 CREATE TABLE IF NOT EXISTS media (
                     id TEXT PRIMARY KEY, server_id TEXT NOT NULL, object_id TEXT NOT NULL,
@@ -63,6 +64,10 @@ class Catalog:
             """)
             if "hidden" not in {r["name"] for r in db.execute("PRAGMA table_info(media)")}:
                 db.execute("ALTER TABLE media ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+            columns = {r["name"] for r in db.execute("PRAGMA table_info(devices)")}
+            for name in ("crawl_root", "crawl_root_title"):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE devices ADD COLUMN {name} TEXT")
 
     @contextmanager
     def connect(self):
@@ -79,6 +84,12 @@ class Catalog:
             db.execute("""INSERT INTO devices(id,name,location,kind,model) VALUES(:id,:name,:location,:kind,:model)
                 ON CONFLICT(id) DO UPDATE SET name=excluded.name,location=excluded.location,
                 kind=excluded.kind,model=excluded.model,seen=CURRENT_TIMESTAMP""", device)
+
+    def crawl_root(self, id, root, title=None):
+        """Admin-chosen crawl root; root None resets to auto. Discovery upserts never touch these columns."""
+        with self.connect() as db:
+            db.execute("UPDATE devices SET crawl_root=?,crawl_root_title=? WHERE id=?",
+                       (root, (title or root) if root else None, id))
 
     def devices(self):
         with self.connect() as db:

@@ -22,10 +22,12 @@ def parse_didl(xml, parent):
     for node in root:
         kind = node.tag.rsplit("}", 1)[-1]
         title = node.findtext(f"{{{DC}}}title") or "名称なし"
-        if kind == "container":
-            result.append({"container": True, "object_id": node.attrib["id"], "title": title})
-            continue
         clazz = node.findtext(f"{{{UPNP}}}class") or ""
+        if kind == "container":
+            count = node.get("childCount", "")
+            result.append({"container": True, "object_id": node.attrib["id"], "title": title, "class": clazz,
+                           "child_count": int(count) if count.isdigit() else None})
+            continue
         resources = []
         for res in node.findall(f"{{{DIDL}}}res"):
             url = (res.text or "").strip()
@@ -47,6 +49,17 @@ def parse_didl(xml, parent):
                        "date": node.findtext(f"{{{DC}}}date") or "",
                        "resources": resources, "metadata": ET.tostring(wrapper, encoding="unicode")})
     return result
+
+
+# Crawl-root detection: only the video branch is walked, not every music/photo view.
+VIDEO_BRANCH = ("ビデオ", "動画", "video", "videos", "movie", "movies")
+ALL_VIDEOS = ("全てのビデオ", "すべてのビデオ", "全ビデオ", "all videos", "all video")
+FOLDERS = ("フォルダー", "フォルダ", "folders", "browse folders")
+ROOT = {"id": "0", "title": "ルート（すべて）"}
+
+
+def named(entries, names):
+    return next((e for e in entries if e["container"] and e["title"].strip().casefold() in names), None)
 
 
 def preferred(item, browser=False):
@@ -109,9 +122,50 @@ class Network:
                         return svc
         raise ValueError(f"{name}サービスがありません")
 
-    async def items(self, device):
+    async def browse(self, service, object_id, start=0, count=200, parent=None):
+        """One BrowseDirectChildren page: (entries, returned, total). Read-only."""
+        response = await service.action("Browse").async_call(
+            ObjectID=object_id, BrowseFlag="BrowseDirectChildren", Filter="*",
+            StartingIndex=start, RequestedCount=count, SortCriteria="")
+        return (parse_didl(response["Result"], parent),
+                int(response["NumberReturned"]), int(response["TotalMatches"]))
+
+    async def containers(self, device, parent="0", limit=500):
+        """Direct child containers of `parent` (first `limit` children), for the source-folder picker."""
         service = await self.service(device, "ContentDirectory")
-        pending, visited = [("0", "未分類")], set()
+        result, start = [], 0
+        while start < limit:
+            entries, count, total = await self.browse(service, parent, start, min(200, limit - start))
+            result += [{"id": e["object_id"], "title": e["title"], "child_count": e["child_count"]}
+                       for e in entries if e["container"]]
+            start += count
+            if count == 0 or start >= total:
+                break
+        return result
+
+    async def detect_root(self, device, service=None):
+        """Video branch -> flat all-videos (only if items carry upnp:album) -> folder view -> branch -> "0"."""
+        service = service or await self.service(device, "ContentDirectory")
+        top = (await self.browse(service, "0"))[0]
+        branch = named(top, VIDEO_BRANCH) or next(
+            (e for e in top if e["container"] and "video" in e["class"].lower()), None)
+        if not branch:
+            return dict(ROOT)
+        children = (await self.browse(service, branch["object_id"]))[0]
+        flat = named(children, ALL_VIDEOS)
+        if flat:
+            videos = [e for e in (await self.browse(service, flat["object_id"]))[0] if not e["container"]]
+            # parent=None leaves album None when the item has no upnp:album of its own.
+            if videos and sum(e["album"] is not None for e in videos) >= 0.9 * len(videos):
+                return {"id": flat["object_id"], "title": flat["title"]}
+        folder = named(children, FOLDERS)
+        chosen = folder or branch
+        return {"id": chosen["object_id"], "title": chosen["title"]}
+
+    async def items(self, device, root="0", parent="未分類"):
+        """Recursive walk from `root`; items directly in it get `parent` as their album fallback."""
+        service = await self.service(device, "ContentDirectory")
+        pending, visited = [(root, parent)], set()
         while pending:
             object_id, parent = pending.pop()
             if object_id in visited:
@@ -119,16 +173,12 @@ class Network:
             visited.add(object_id)
             start = 0
             while True:
-                response = await service.action("Browse").async_call(
-                    ObjectID=object_id, BrowseFlag="BrowseDirectChildren", Filter="*",
-                    StartingIndex=start, RequestedCount=200, SortCriteria="")
-                entries = parse_didl(response["Result"], parent)
+                entries, count, total = await self.browse(service, object_id, start, 200, parent)
                 for entry in entries:
                     if entry["container"]:
                         pending.append((entry["object_id"], entry["title"]))
                     else:
                         yield entry
-                count, total = int(response["NumberReturned"]), int(response["TotalMatches"])
                 if count == 0:
                     if start < total:
                         raise ValueError("Browseのページングが途中で停止しました")

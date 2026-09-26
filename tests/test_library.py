@@ -67,7 +67,9 @@ def test_crawl_failure_keeps_existing_media(tmp_path):
     db = Catalog(tmp_path)
     id = db.upsert(SERVER["id"], item())
     class Broken:
-        async def items(self, device):
+        async def detect_root(self, device):
+            return {"id": "0", "title": "root"}
+        async def items(self, device, root, parent):
             if False:
                 yield
             raise RuntimeError("server offline")
@@ -294,10 +296,14 @@ def items(*names):
 class FakeNetwork:
     def __init__(self, sources, fail=False, gate=None):
         self.sources, self.fail, self.gate = sources, fail, gate
-        self.calls = 0
+        self.calls, self.roots = 0, []
 
-    async def items(self, device):
+    async def detect_root(self, device):
+        return {"id": "v", "title": "全てのビデオ"}
+
+    async def items(self, device, root, parent):
         self.calls += 1
+        self.roots.append((root, parent))
         for index, source in enumerate(self.sources):
             if self.gate and index:
                 await asyncio.wait_for(self.gate.wait(), 5)
@@ -561,3 +567,141 @@ def test_hidden_flag_survives_crawl_and_migration(tmp_path, monkeypatch):
     crawl(db, FakeNetwork(changed))
     assert db.get(a)["hidden"] == 1 and db.get(a)["source_title"] == "renamed.mp4"
     assert [r["object_id"] for r in db.media(SERVER["id"], include_hidden=False)] == ["b"]
+
+
+def didl(*children):
+    ns = 'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"'
+    return f"<DIDL-Lite {ns}>{''.join(children)}</DIDL-Lite>"
+
+
+def folder(id, title, clazz="object.container.storageFolder"):
+    return f'<container id="{id}" childCount="3"><dc:title>{title}</dc:title><upnp:class>{clazz}</upnp:class></container>'
+
+
+def video(id, album=True):
+    return (f'<item id="{id}"><dc:title>{id}.mp4</dc:title>' + ("<upnp:album>2024-01 旅行</upnp:album>" if album else "") +
+            f'<upnp:class>object.item.videoItem</upnp:class><res protocolInfo="http-get:*:video/mp4:*">http://localhost/{id}.mp4</res></item>')
+
+
+class TreeService:
+    """Read-only fake ContentDirectory: {object_id: [child xml...]}."""
+    def __init__(self, tree):
+        self.tree, self.browsed = tree, []
+
+    def action(self, name):
+        assert name == "Browse"
+        async def call(ObjectID, StartingIndex, RequestedCount, **kwargs):
+            self.browsed.append(ObjectID)
+            children = self.tree.get(ObjectID, [])
+            page = children[StartingIndex:StartingIndex + RequestedCount]
+            return {"Result": didl(*page), "NumberReturned": len(page), "TotalMatches": len(children)}
+        return type("Action", (), {"async_call": staticmethod(call)})()
+
+
+def tree_network(tree):
+    net, service = Network(), TreeService(tree)
+    net.service = AsyncMock(return_value=service)
+    return net, service
+
+
+def twonky(album=True):
+    return {"0": [folder("0$1", "ミュージック"), folder("0$2", "ピクチャー"), folder("0$3", "ビデオ")],
+            "0$3": [folder("0$3$37", "アルバム"), folder("0$3$35", "フォルダー"), folder("0$3$28", "全てのビデオ")],
+            "0$3$28": [video("v1", album), video("v2", album)],
+            "0$3$35": [folder("0$3$35$1", "2024-01 旅行")], "0$3$35$1": [video("v1", album), video("v2", album)]}
+
+
+def test_detect_root_prefers_flat_container_with_albums():
+    net, service = tree_network(twonky())
+    assert asyncio.run(net.detect_root(SERVER)) == {"id": "0$3$28", "title": "全てのビデオ"}
+    assert "0$1" not in service.browsed and "0$2" not in service.browsed  # music/photo views untouched
+    async def walk():
+        return [i async for i in net.items(SERVER, "0$3$28")]
+    assert [(i["object_id"], i["album"]) for i in asyncio.run(walk())] == [("v1", "2024-01 旅行"), ("v2", "2024-01 旅行")]
+
+
+def test_detect_root_uses_folders_when_flat_items_lack_albums():
+    tree = twonky(album=False)  # MiniDLNA style: "All Video" items carry no upnp:album
+    tree["0"] = [folder("64", "Browse Folders"), folder("1", "Music"), folder("2", "Video", "object.container")]
+    tree["2"] = [folder("2$8", "All Video"), folder("2$15", "Folders")]
+    tree["2$8"], tree["2$15"] = tree.pop("0$3$28"), tree.pop("0$3$35")
+    net, _ = tree_network(tree)
+    assert asyncio.run(net.detect_root(SERVER)) == {"id": "2$15", "title": "Folders"}
+    async def walk():
+        return [i async for i in net.items(SERVER, "2$15")]
+    assert {i["album"] for i in asyncio.run(walk())} == {"2024-01 旅行"}  # parent folder, not "All Video"
+
+
+def test_detect_root_by_class_and_fallbacks():
+    net, _ = tree_network({"0": [folder("a", "Media", "object.container.videoContainer")], "a": [folder("b", "x")]})
+    assert asyncio.run(net.detect_root(SERVER)) == {"id": "a", "title": "Media"}  # branch itself
+    net, _ = tree_network({"0": [folder("m", "Music"), folder("p", "Photos")]})
+    assert asyncio.run(net.detect_root(SERVER))["id"] == "0"
+    net, _ = tree_network({"0": [folder("1", "ミュージック"), folder("3", "ビデオ")], "3": [folder("7", "フォルダ")]})
+    assert asyncio.run(net.containers(SERVER, "0")) == [{"id": "1", "title": "ミュージック", "child_count": 3},
+                                                        {"id": "3", "title": "ビデオ", "child_count": 3}]
+
+
+def test_manual_root_overrides_auto_and_survives_discovery(tmp_path, monkeypatch):
+    db = Catalog(tmp_path)
+    fake_thumbnails(monkeypatch, [])
+    db.device(SERVER)
+    network = FakeNetwork(items("a"))
+    async def run(device):
+        crawler = Crawler(db, network)
+        crawler.start(device)
+        await crawler.tasks[SERVER["id"]]
+        return crawler.status[SERVER["id"]]
+    status = asyncio.run(run(db.get_device(SERVER["id"])))
+    assert status["root"] == {"id": "v", "title": "全てのビデオ", "auto": True} and network.roots[-1] == ("v", "未分類")
+    db.crawl_root(SERVER["id"], "0$3$35", "フォルダー")
+    db.device({**SERVER, "name": "renamed"})  # discovery upsert keeps the admin choice
+    device = db.get_device(SERVER["id"])
+    assert (device["name"], device["crawl_root"], device["crawl_root_title"]) == ("renamed", "0$3$35", "フォルダー")
+    status = asyncio.run(run(device))
+    assert status["root"] == {"id": "0$3$35", "title": "フォルダー", "auto": False} and network.roots[-1][0] == "0$3$35"
+    db.crawl_root(SERVER["id"], None, "ignored")
+    assert db.get_device(SERVER["id"])["crawl_root"] is db.get_device(SERVER["id"])["crawl_root_title"] is None
+
+
+def test_devices_migration_adds_crawl_root(tmp_path):
+    import sqlite3
+    with sqlite3.connect(tmp_path / "catalog.sqlite3") as conn:
+        conn.execute("CREATE TABLE devices (id TEXT PRIMARY KEY, name TEXT NOT NULL, location TEXT NOT NULL,"
+                     " kind TEXT NOT NULL, model TEXT, seen TEXT DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute("INSERT INTO devices(id,name,location,kind) VALUES('uuid:server','n','http://x','server')")
+    db = Catalog(tmp_path)
+    assert db.get_device(SERVER["id"])["crawl_root"] is None
+    db.crawl_root(SERVER["id"], "7")
+    assert Catalog(tmp_path).get_device(SERVER["id"])["crawl_root_title"] == "7"
+
+
+def test_empty_crawl_fails_without_finish_scan(tmp_path, monkeypatch):
+    db = Catalog(tmp_path)
+    old = db.upsert(SERVER["id"], items("old")[0])
+    finish = []
+    monkeypatch.setattr(db, "finish_scan", lambda *args: finish.append(args))
+    status = crawl(db, FakeNetwork([]))
+    assert status["state"] == "failed" and not finish
+    assert status["errors"] == ["動画が見つかりませんでした。取得元フォルダを確認してください"]
+    assert db.get(old)["available"] == 1
+
+
+def test_crawl_root_api_is_admin_only(tmp_path, monkeypatch):
+    app, _ = role_app(tmp_path, monkeypatch)
+    net = app.state.crawler.network
+    net.containers = AsyncMock(return_value=[{"id": "0$3", "title": "ビデオ", "child_count": 7}])
+    path = "/api/servers/uuid:server/"
+    with TestClient(app, **LAN) as client:
+        assert client.get(path + "containers", headers=GUEST).status_code == 403
+        assert client.get(path + "crawl-root", headers=GUEST).status_code == 403
+        assert client.put(path + "crawl-root", headers=GUEST, json={"id": "x"}).status_code == 403
+        assert client.get(path + "crawl", headers=GUEST).json()["root"] is None  # guests still see status
+        assert client.get(path + "containers", params={"parent": "0$3"}, headers=ADMIN).json()[0]["title"] == "ビデオ"
+        assert net.containers.call_args.args[1] == "0$3"
+        assert client.get("/api/servers/uuid:tv/containers", headers=ADMIN).status_code == 404
+        assert client.put(path + "crawl-root", headers=ADMIN, json={"id": "0$3", "title": "ビデオ"}).json() == {
+            "id": "0$3", "title": "ビデオ", "last": None}
+        assert client.put(path + "crawl-root", headers=ADMIN, json={"id": "x" * 1025}).status_code == 422
+        assert client.put(path + "crawl-root", headers=ADMIN, json={"id": ""}).status_code == 422
+        assert client.put(path + "crawl-root", headers=ADMIN, json={"id": None}).json()["id"] is None
