@@ -106,6 +106,22 @@ VPN接続中はデフォルトルートがVPN側になり、IPが取得できな
 SSDPの送信インターフェースを固定する場合は `DLNA_INTERFACE` にMacのLAN側IPv4アドレスを指定します。
 `FFMPEG` / `FFPROBE`で実行ファイルのパスを指定できます。
 
+## 常駐させる（LaunchAgent）
+
+`install-daemon.sh` で `launch.sh` をLaunchAgentとして登録すると、ログイン時に自動起動し、異常終了時も再起動します。
+トークンは入力を求め、本人のみ読める設定ファイル（`~/Library/LaunchAgents/local.webvideo.plist`）に保存します。
+
+```bash
+./install-daemon.sh -name mymac -allowip '192.168.1.0/24,!192.168.1.1'
+```
+
+- データの保存先は既定で `~/Library/Application Support/webvideo`（`-data`で変更）。空なら `./data` をコピーして引き継ぎます。
+- `./install-daemon.sh status` / `restart`（コード更新後）/ `logs` / `uninstall`。`-dry-run` で登録せずに設定を確認できます。
+- 初回はローカルネットワークへのアクセス許可を求められることがあります。許可しないと機器検索やNASへの接続が失敗します。
+- ログインしている間だけ動きます。画面なしで運用するMacでは自動ログインを有効にしてください。
+- 手動で起動したサーバーが同じポートを使っていると登録できません。先に止めてください。
+- 起動中にLAN IPが変わった場合は `restart` してください（ルーターでIPを固定しておくのがおすすめです）。
+
 ## 現時点の制約・実機確認事項
 
 - NAS・テレビ実機との互換性は未検証。HTTP Range、M2TS/MTS、対応リソース、DIDLメタデータ、完了時の返り値は実機で確認が必要です。
