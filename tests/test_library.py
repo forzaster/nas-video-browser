@@ -274,3 +274,148 @@ def test_completed_track_advances(tmp_path, monkeypatch):
     assert state["index"] == 1
     assert state["media_id"] == next_id
     assert [c.args[1] for c in net.command.call_args_list][4:6] == ["SetAVTransportURI", "Play"]
+
+
+def items(*names):
+    result = []
+    for name in names:
+        source = item()
+        source["object_id"] = name
+        result.append(source)
+    return result
+
+
+class FakeNetwork:
+    def __init__(self, sources, fail=False, gate=None):
+        self.sources, self.fail, self.gate = sources, fail, gate
+        self.calls = 0
+
+    async def items(self, device):
+        self.calls += 1
+        for index, source in enumerate(self.sources):
+            if self.gate and index:
+                await asyncio.wait_for(self.gate.wait(), 5)
+            yield source
+        if self.fail:
+            raise RuntimeError("server offline")
+
+
+def fake_thumbnails(monkeypatch, calls):
+    async def fake(catalog, row):
+        calls.append(row["id"])
+        name = f"{row['id']}-{row['fingerprint'][:16]}.jpg"
+        (catalog.thumbs / name).write_bytes(b"jpg")
+        catalog.thumbnail(row["id"], row["fingerprint"], name)
+        return True
+    monkeypatch.setattr("app.jobs.make_thumbnail", fake)
+
+
+def crawl(db, network):
+    async def run():
+        crawler = Crawler(db, network)
+        crawler.start(SERVER)
+        await crawler.tasks[SERVER["id"]]
+        return crawler.status[SERVER["id"]]
+    return asyncio.run(run())
+
+
+def test_unchanged_items_are_skipped(tmp_path, monkeypatch):
+    db = Catalog(tmp_path)
+    calls = []
+    fake_thumbnails(monkeypatch, calls)
+    status = crawl(db, FakeNetwork(items("a", "b", "c")))
+    assert (status["state"], status["count"], status["new"], status["skipped"]) == ("complete", 3, 3, 0)
+    assert (status["thumbnails"], status["thumbs_total"], len(calls)) == (3, 3, 3)
+    with db.connect() as conn:  # a rewrite would reset this marker
+        conn.execute("UPDATE media SET updated='marker'")
+    changed = items("a", "b", "c", "d")
+    changed[1]["title"] = "renamed.mp4"
+    status = crawl(db, FakeNetwork(changed))
+    assert (status["count"], status["new"], status["updated"], status["skipped"]) == (4, 1, 1, 2)
+    # Only the new item needs FFmpeg; b keeps its fingerprint so its cached thumbnail is reused.
+    assert len(calls) == 4 and (status["thumbnails"], status["thumbs_skipped"]) == (1, 3)
+    rows = {m["object_id"]: m for m in db.media(SERVER["id"])}
+    assert rows["a"]["updated"] == rows["c"]["updated"] == "marker"
+    assert rows["b"]["updated"] != "marker" and rows["b"]["source_title"] == "renamed.mp4"
+    assert all(r["thumbnail"] for r in rows.values())
+
+
+def test_failed_thumbnail_is_retried_and_cached_one_is_not(tmp_path, monkeypatch):
+    db = Catalog(tmp_path)
+    ok, bad = (db.upsert(SERVER["id"], s) for s in items("ok", "bad"))
+    row = db.get(ok)
+    (db.thumbs / f"{ok}-{row['fingerprint'][:16]}.jpg").write_bytes(b"cached")
+    db.thumbnail(bad, db.get(bad)["fingerprint"], error="ffmpeg failed")
+    process = AsyncMock(side_effect=RuntimeError("still broken"))
+    monkeypatch.setattr("app.jobs.run_process", process)
+    status = crawl(db, FakeNetwork(items("ok", "bad")))
+    assert status["state"] == "complete" and status["skipped"] == 2
+    assert status["thumbs_skipped"] == 1 and status["thumbs_total"] == 1 and status["thumbnails"] == 0
+    assert process.call_count == 1 and len(status["errors"]) == 1  # retried once, only for the failed one
+    assert db.get(ok)["thumbnail"] and db.get(bad)["thumb_error"] == "still broken"
+
+
+def test_start_is_idempotent_while_running(tmp_path, monkeypatch):
+    db = Catalog(tmp_path)
+    fake_thumbnails(monkeypatch, [])
+    gate = asyncio.Event()
+    network = FakeNetwork(items("a", "b"), gate=gate)
+    async def run():
+        crawler = Crawler(db, network)
+        first = crawler.start(SERVER)
+        task = crawler.tasks[SERVER["id"]]
+        await asyncio.sleep(0.01)
+        assert crawler.start(SERVER) is first and crawler.tasks[SERVER["id"]] is task
+        other = crawler.start({**SERVER, "id": "uuid:other"})  # another server never cancels this one
+        gate.set()
+        await task
+        await crawler.tasks["uuid:other"]
+        assert first["state"] == other["state"] == "complete" and not task.cancelled()
+        assert crawler.start(SERVER) is not first  # finished crawls can be restarted
+        await crawler.tasks[SERVER["id"]]
+    asyncio.run(run())
+    assert network.calls == 3
+
+
+def test_scan_failure_skips_finish_scan(tmp_path, monkeypatch):
+    db = Catalog(tmp_path)
+    fake_thumbnails(monkeypatch, [])
+    old = db.upsert(SERVER["id"], items("gone")[0])
+    finish = []
+    monkeypatch.setattr(db, "finish_scan", lambda *args: finish.append(args))
+    status = crawl(db, FakeNetwork(items("a"), fail=True))
+    assert status["state"] == "failed" and status["count"] == 1 and not finish
+    assert db.get(old)["available"] == 1
+
+
+def test_thumbnails_are_generated_during_scan(tmp_path, monkeypatch):
+    db = Catalog(tmp_path)
+    gate, calls = asyncio.Event(), []
+    async def fake(catalog, row):
+        calls.append(row["object_id"])
+        gate.set()  # the scan only continues once the first thumbnail started
+        return True
+    monkeypatch.setattr("app.jobs.make_thumbnail", fake)
+    status = crawl(db, FakeNetwork(items("a", "b"), gate=gate))
+    assert status["state"] == "complete" and calls == ["a", "b"] and status["thumbnails"] == 2
+
+
+def test_cancel_stops_thumbnail_workers(tmp_path, monkeypatch):
+    db = Catalog(tmp_path)
+    started, workers = asyncio.Event(), []
+    async def slow(catalog, row):
+        workers.append(asyncio.current_task())
+        started.set()
+        await asyncio.sleep(60)
+    monkeypatch.setattr("app.jobs.make_thumbnail", slow)
+    async def run():
+        crawler = Crawler(db, FakeNetwork(items("a")))
+        crawler.start(SERVER)
+        task = crawler.tasks[SERVER["id"]]
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert crawler.status[SERVER["id"]]["state"] == "interrupted"
+        assert workers and all(w.done() for w in workers)
+        assert [t for t in asyncio.all_tasks() if t is not asyncio.current_task()] == []
+    asyncio.run(run())

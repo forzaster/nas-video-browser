@@ -193,7 +193,7 @@ def create_app(directory=None, network=None):
     @app.get("/api/servers/{id}/crawl")
     def crawl_state(id: str):
         device(id, "server")
-        return crawler.status.get(id, {"state": "idle", "count": 0, "thumbnails": 0, "errors": []})
+        return crawler.state(id)
 
     @app.get("/api/media")
     def media(server_id: str, year: str | None = None, album: str | None = None):

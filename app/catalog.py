@@ -77,20 +77,29 @@ class Catalog:
         return next((d for d in self.devices() if d["id"] == id), None)
 
     def upsert(self, server_id, item):
+        return self.sync(server_id, item)["id"]
+
+    def sync(self, server_id, item):
+        """Store an item; unchanged, visible rows are not rewritten. state: new/updated/unchanged."""
         id = digest(server_id + "\0" + item["object_id"])
         resources = json.dumps(item["resources"], ensure_ascii=False, sort_keys=True)
         fingerprint = digest(resources + (item.get("date") or ""))
+        values = (item["title"], item["album"], year_for(item["album"], item.get("date"), item["title"]),
+                  item.get("date"), resources, item["metadata"], fingerprint)
         with self.connect() as db:
+            old = db.execute("""SELECT source_title,album,year,date,resources,metadata,fingerprint,thumbnail,available
+                FROM media WHERE id=?""", (id,)).fetchone()
+            if old and old["available"] and tuple(old)[:7] == values:
+                return {"id": id, "state": "unchanged", "fingerprint": fingerprint, "thumbnail": old["thumbnail"]}
             db.execute("""INSERT INTO media(id,server_id,object_id,source_title,album,year,date,resources,metadata,fingerprint)
                 VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
                 source_title=excluded.source_title,album=excluded.album,year=excluded.year,date=excluded.date,
                 resources=excluded.resources,metadata=excluded.metadata,
                 thumbnail=CASE WHEN media.fingerprint=excluded.fingerprint THEN media.thumbnail ELSE NULL END,
                 thumb_error=NULL, fingerprint=excluded.fingerprint,available=1,updated=CURRENT_TIMESTAMP""",
-                (id, server_id, item["object_id"], item["title"], item["album"],
-                 year_for(item["album"], item.get("date"), item["title"]), item.get("date"),
-                 resources, item["metadata"], fingerprint))
-        return id
+                (id, server_id, item["object_id"], *values))
+        thumbnail = old["thumbnail"] if old and old["fingerprint"] == fingerprint else None
+        return {"id": id, "state": "updated" if old else "new", "fingerprint": fingerprint, "thumbnail": thumbnail}
 
     def finish_scan(self, server_id, ids):
         # Only called after the entire tree succeeds. Failed crawls never hide existing media.

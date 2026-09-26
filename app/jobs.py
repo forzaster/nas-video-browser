@@ -32,12 +32,17 @@ async def run_process(*args, timeout=90):
     return out
 
 
+def thumb_name(id, fingerprint):
+    return f"{id}-{fingerprint[:16]}.jpg"
+
+
 async def make_thumbnail(catalog, item):
-    filename = f"{item['id']}-{item['fingerprint'][:16]}.jpg"
+    """Returns True when FFmpeg ran, False when the cached file was reused."""
+    filename = thumb_name(item["id"], item["fingerprint"])
     final = catalog.thumbs / filename
     if final.exists():
         catalog.thumbnail(item["id"], item["fingerprint"], filename)
-        return
+        return False
     resource = preferred(item)
     url = resource["url"]
     duration = seconds(resource.get("duration"))
@@ -65,6 +70,7 @@ async def make_thumbnail(catalog, item):
             "-map", "[v]", "-frames:v", "1", str(temporary))
         temporary.replace(final)
         catalog.thumbnail(item["id"], item["fingerprint"], filename)
+        return True
     except Exception as error:
         catalog.thumbnail(item["id"], item["fingerprint"], error=str(error))
         raise
@@ -74,34 +80,71 @@ async def make_thumbnail(catalog, item):
         (catalog.thumbs / f"{filename}.tmp.jpg").unlink(missing_ok=True)
 
 
+def crawl_status(state="idle"):
+    # count=found, new/updated/skipped=DB rows, thumbnails=generated of thumbs_total queued, thumbs_skipped=cached
+    return {"state": state, "count": 0, "new": 0, "updated": 0, "skipped": 0,
+            "thumbnails": 0, "thumbs_total": 0, "thumbs_skipped": 0, "errors": []}
+
+
 class Crawler:
+    """One crawl per server at a time; thumbnails are generated while the tree is still being scanned."""
+    workers = 2
+
     def __init__(self, catalog, network):
         self.catalog, self.network = catalog, network
         self.tasks, self.status = {}, {}
+
+    def state(self, id):
+        return self.status.get(id) or crawl_status()
 
     def start(self, device):
         id = device["id"]
         if id in self.tasks and not self.tasks[id].done():
             return self.status[id]
-        self.status[id] = {"state": "scanning", "count": 0, "thumbnails": 0, "errors": []}
+        self.status[id] = crawl_status("scanning")
         self.tasks[id] = asyncio.create_task(self.crawl(device))
         return self.status[id]
 
+    async def thumbnailer(self, queue, status):
+        while True:
+            id, item = await queue.get(), None
+            try:
+                item = self.catalog.get(id)
+                if await make_thumbnail(self.catalog, item):
+                    status["thumbnails"] += 1
+                else:
+                    status["thumbs_skipped"] += 1
+                    status["thumbs_total"] -= 1
+            except Exception as error:
+                status["errors"].append(f"{item['source_title'] if item else id}: {error}")
+            finally:
+                queue.task_done()
+
     async def crawl(self, device):
         status = self.status[device["id"]]
-        ids = set()
+        queue, ids = asyncio.Queue(), set()
+        workers = [asyncio.create_task(self.thumbnailer(queue, status)) for _ in range(self.workers)]
         try:
             async for item in self.network.items(device):
-                ids.add(self.catalog.upsert(device["id"], item))
+                row = self.catalog.sync(device["id"], item)
+                if row["id"] in ids:
+                    continue
+                ids.add(row["id"])
                 status["count"] = len(ids)
+                status[{"new": "new", "updated": "updated", "unchanged": "skipped"}[row["state"]]] += 1
+                filename = thumb_name(row["id"], row["fingerprint"])
+                if not (self.catalog.thumbs / filename).exists():
+                    # Missing or previously failed: (re)generate in the background.
+                    status["thumbs_total"] += 1
+                    queue.put_nowait(row["id"])
+                    continue
+                if row["thumbnail"] != filename:
+                    self.catalog.thumbnail(row["id"], row["fingerprint"], filename)
+                status["thumbs_skipped"] += 1
+            # Only after the entire tree succeeded. Failed crawls never hide existing media.
             self.catalog.finish_scan(device["id"], ids)
             status["state"] = "thumbnails"
-            for id in sorted(ids):
-                try:
-                    await make_thumbnail(self.catalog, self.catalog.get(id))
-                    status["thumbnails"] += 1
-                except Exception as error:
-                    status["errors"].append(f"{self.catalog.get(id)['source_title']}: {error}")
+            await queue.join()
             status["state"] = "complete"
         except asyncio.CancelledError:
             status["state"] = "interrupted"
@@ -109,6 +152,10 @@ class Crawler:
         except Exception as error:
             status["state"] = "failed"
             status["errors"].append(str(error))
+        finally:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
 
 
 class Player:

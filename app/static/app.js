@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 let media = [], year = null, album = null, editId = null, queue = [], index = 0, activeRenderer = '', playingId = null;
-let fetchVersion = 0, scanWasRunning = false;
+let fetchVersion = 0, scanWasRunning = false, mediaSignature = '';
 const enc = encodeURIComponent;
 function el(tag, text, cls) { const n = document.createElement(tag); if(text !== undefined) n.textContent = text; if(cls)n.className = cls; return n; }
 function message(text, detail = '') { $('message').textContent = text; $('message').title = detail; }
@@ -22,11 +22,14 @@ async function devices() {
     if([...select.options].some(o=>o.value===previous))select.value=previous;
   }
 }
-async function refresh() {
+// Periodic refreshes skip re-rendering when nothing changed, so hover/scroll/focus survive.
+async function refresh(force = true) {
   const version = ++fetchVersion, server = $('server').value;
   const result = server ? await api('/media?server_id='+enc(server)) : [];
   if(version !== fetchVersion)return;
-  media = result; render();
+  const signature = server + '\n' + JSON.stringify(result);
+  if(!force && signature === mediaSignature)return;
+  mediaSignature = signature; media = result; render();
 }
 function thumb(item) {
   const cover = el('button',undefined,'cover'); cover.type='button';
@@ -92,8 +95,11 @@ $('discover').onclick=action(async()=>{$('discover').disabled=true;try{const res
   message('MediaServer '+count('server')+' 台・再生先 '+count('renderer')+' 台を検出'+(result.errors.length?'（一部の機器情報を取得できませんでした）':''),result.errors.map(String).join('\n'));
 }finally{$('discover').disabled=false;}});
 $('add').onsubmit=action(async e=>{e.preventDefault();await api('/devices','POST',{url:$('location').value});await devices();});
-$('server').onchange=action(async()=>{year=null;album=null;await refresh();if($('server').value){await api('/servers/'+enc($('server').value)+'/crawl','POST');scanWasRunning=true;}});
-$('crawl').onclick=action(async()=>{if(!$('server').value)throw new Error('MediaServerを選択してください');await api('/servers/'+enc($('server').value)+'/crawl','POST');scanWasRunning=true;});
+// Starting is idempotent on the server: a running crawl is joined, never duplicated or cancelled.
+// Switching servers only changes what is displayed; other crawls keep running in the background.
+async function startCrawl(){const server=$('server').value;const state=await api('/servers/'+enc(server)+'/crawl','POST');if(server===$('server').value){showCrawl(state);scanWasRunning=true;}}
+$('server').onchange=action(async()=>{year=null;album=null;showCrawl(null);await refresh();if($('server').value)await startCrawl();});
+$('crawl').onclick=action(async()=>{if(!$('server').value)throw new Error('MediaServerを選択してください');await startCrawl();});
 $('title-form').onsubmit=action(async e=>{e.preventDefault();await api('/media/'+editId+'/title','PATCH',{title:$('title').value});$('edit').close();await refresh();});
 $('cancel').onclick=()=>$('edit').close();
 $('stop').onclick=action(stop);
@@ -101,10 +107,22 @@ $('pause').onclick=action(async()=>{if(activeRenderer)await api('/renderers/'+en
 $('play').onclick=action(async()=>{if(activeRenderer)await api('/renderers/'+enc(activeRenderer)+'/play','POST');else if($('video').src)await $('video').play();});
 $('login').onsubmit=action(async e=>{e.preventDefault();await api('/login','POST',{token:$('token').value});$('token').value='';$('login').hidden=true;await devices();});
 const crawlLabels={idle:'待機',scanning:'動画を取得中',thumbnails:'サムネイル生成中',complete:'クロール完了',failed:'クロール失敗',interrupted:'中断'};
-async function poll(){try{const status=$('crawl-status');
-  if($('server').value){const state=await api('/servers/'+enc($('server').value)+'/crawl');status.textContent=crawlLabels[state.state]+' · '+state.count+' 本 / サムネイル '+state.thumbnails+' 件'+(state.errors.length?' · エラー '+state.errors.length+' 件':'');status.title=state.errors.join('\n');status.dataset.state=state.state;
-    const running=['scanning','thumbnails'].includes(state.state);if(running||scanWasRunning)await refresh();scanWasRunning=running;}
+const isRunning=state=>!!state&&['scanning','thumbnails'].includes(state.state);
+function showCrawl(state){const status=$('crawl-status'),button=$('crawl'),running=isRunning(state);
+  if(state){const parts=[crawlLabels[state.state]||state.state,state.count+' 本'];
+    if(state.count)parts[1]+='（新規 '+state.new+(state.updated?'・更新 '+state.updated:'')+'・既存 '+state.skipped+'）';
+    if(state.thumbs_total)parts.push('サムネイル '+state.thumbnails+'/'+state.thumbs_total);
+    if(state.errors.length)parts.push('エラー '+state.errors.length+' 件');
+    status.textContent=parts.join(' · ');status.title=state.errors.join('\n');status.dataset.state=state.state;}
   else{status.textContent='';status.title='';delete status.dataset.state;}
+  status.setAttribute('aria-busy',running);$('server-spinner').hidden=!running;
+  button.textContent=running?'取得中…':'再クロール';button.classList.toggle('busy',running);button.setAttribute('aria-busy',running);
+  button.title=running?'バックグラウンドで取得中です（押しても重複して実行されません）':'';}
+async function poll(){try{
+  const server=$('server').value;
+  if(server){const state=await api('/servers/'+enc(server)+'/crawl');
+    if(server===$('server').value){showCrawl(state);const running=isRunning(state);if(running||scanWasRunning)await refresh(false);scanWasRunning=running;}}
+  else showCrawl(null);
   if(activeRenderer){const state=await api('/renderers/'+enc(activeRenderer)+'/state');$('now').textContent=[state.title,state.state,state.position+'/'+state.duration,state.error].filter(Boolean).join(' · ');if(playingId!==state.media_id){playingId=state.media_id;render();}}
   }catch(e){message(e.message);}finally{setTimeout(poll,2500);}}
 // Keep page content clear of the fixed player dock, whose height changes when the video is shown.

@@ -358,11 +358,44 @@ input:focus-visible { outline-offset: 0; border-color: var(--accent-line); }
 
 .status-pill[data-state="complete"]::before { background: var(--ok); }
 
+/* Running crawl: the dot becomes a spinning amber ring. */
+.status-pill[data-state="scanning"],
+.status-pill[data-state="thumbnails"] {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
 .status-pill[data-state="scanning"]::before,
-.status-pill[data-state="thumbnails"]::before {
-  background: var(--accent);
-  box-shadow: 0 0 0 0 var(--accent-line);
-  animation: pulse 1.6s ease-out infinite;
+.status-pill[data-state="thumbnails"]::before,
+.spinner,
+.btn.busy::before {
+  content: "";
+  flex: none;
+  box-sizing: border-box;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--accent-line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  background: transparent;
+  animation: spin 0.8s linear infinite;
+}
+
+.spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-left: 4px;
+  vertical-align: -1px;
+}
+
+.spinner[hidden] { display: none; }
+
+.btn.busy {
+  border-color: var(--accent-line);
+  color: var(--accent);
+  cursor: progress;
 }
 
 .status-pill[data-state="failed"]::before,
@@ -370,9 +403,11 @@ input:focus-visible { outline-offset: 0; border-color: var(--accent-line); }
 
 .status-pill[title]:not([title=""]) { cursor: help; }
 
-@keyframes pulse {
-  0% { box-shadow: 0 0 0 0 var(--accent-line); }
-  100% { box-shadow: 0 0 0 8px rgba(255, 181, 71, 0); }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@keyframes busy-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
 }
 
 /* Message / notice */
@@ -1131,6 +1166,15 @@ dialog::backdrop {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+  /* No rotation: running indicators fade gently instead. */
+  .status-pill[data-state="scanning"]::before,
+  .status-pill[data-state="thumbnails"]::before,
+  .spinner,
+  .btn.busy::before {
+    border-color: var(--accent);
+    background: var(--accent);
+    animation: busy-pulse 1.6s ease-in-out infinite !important;
   }
   .card:hover,
   .card:focus-within { transform: none; }
