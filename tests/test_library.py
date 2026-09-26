@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -7,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.catalog import Catalog, display_title, year_for
-from app.jobs import Crawler, Player, make_thumbnail
+from app.jobs import THUMB_WORKERS, Crawler, Player, make_thumbnail, process_slots, run_process
 from app.main import create_app
 from app.upnp import Network, parse_didl
 
@@ -94,6 +95,91 @@ def test_cache_reuse_does_not_invoke_ffmpeg(tmp_path, monkeypatch):
     assert db.get(id)["thumbnail"] == filename
     process.assert_not_called()
 
+
+
+def fake_ffmpeg(monkeypatch, frame):
+    """run_process stand-in: ffprobe reports 100s, frames go to `frame(part)`, xstack writes the output."""
+    async def process(*args, timeout=90):
+        if args[0] == "ffprobe":
+            return b'{"format": {"duration": "100"}}'
+        if "-filter_complex" in args:
+            Path(args[-1]).write_bytes(b"jpg")
+            return b""
+        return await frame(Path(args[-1]))
+    monkeypatch.setattr("app.jobs.run_process", process)
+
+
+def test_frames_are_extracted_concurrently(tmp_path, monkeypatch):
+    db = Catalog(tmp_path)
+    row = db.get(db.upsert(SERVER["id"], item()))
+    active, peak = [0], [0]
+    async def frame(part):
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        await asyncio.sleep(0.01)
+        part.write_bytes(b"part")
+        active[0] -= 1
+    fake_ffmpeg(monkeypatch, frame)
+    assert asyncio.run(make_thumbnail(db, row)) is True
+    assert peak[0] == 4
+    assert [f.name for f in db.thumbs.iterdir()] == [db.get(row["id"])["thumbnail"]]
+
+
+def test_failed_frame_cancels_the_others_and_cleans_up(tmp_path, monkeypatch):
+    db = Catalog(tmp_path)
+    row = db.get(db.upsert(SERVER["id"], item()))
+    started, cancelled = [], []
+    async def frame(part):
+        part.write_bytes(b"part")
+        started.append(part)
+        if part.name.endswith(".0.jpg"):
+            while len(started) < 4:
+                await asyncio.sleep(0)
+            raise RuntimeError("frame broken")
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.append(part)
+            raise
+    fake_ffmpeg(monkeypatch, frame)
+    with pytest.raises(RuntimeError, match="frame broken"):
+        asyncio.run(asyncio.wait_for(make_thumbnail(db, row), 5))
+    assert len(cancelled) == 3 and list(db.thumbs.iterdir()) == []
+    assert db.get(row["id"])["thumb_error"] == "frame broken"
+
+
+def test_process_cap_bounds_concurrent_ffmpeg(monkeypatch):
+    monkeypatch.setenv("DLNA_FFMPEG_JOBS", "2")
+    active, peak = [0], [0]
+    class Proc:
+        returncode = None
+        async def communicate(self):
+            await asyncio.sleep(0.01)
+            active[0] -= 1
+            self.returncode = 0
+            return b"ok", b""
+    async def spawn(*args, **kwargs):
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        return Proc()
+    monkeypatch.setattr("app.jobs.asyncio.create_subprocess_exec", spawn)
+    async def run():  # e.g. two servers crawling at once share the same slots
+        return await asyncio.gather(*(run_process("ffmpeg") for _ in range(6)))
+    assert asyncio.run(run()) == [b"ok"] * 6 and peak[0] == 2
+
+
+def test_worker_and_process_env_overrides(tmp_path, monkeypatch):
+    db = Catalog(tmp_path)
+    monkeypatch.delenv("DLNA_THUMB_WORKERS", raising=False)
+    assert Crawler(db, None).workers == THUMB_WORKERS
+    monkeypatch.setenv("DLNA_THUMB_WORKERS", "6")
+    assert Crawler(db, None).workers == 6
+    monkeypatch.setenv("DLNA_THUMB_WORKERS", "many")
+    assert Crawler(db, None).workers == THUMB_WORKERS
+    monkeypatch.setenv("DLNA_FFMPEG_JOBS", "3")
+    async def slots():
+        return process_slots()._value
+    assert asyncio.run(slots()) == 3
 
 def test_api_title_and_device_control(tmp_path):
     net = Network()
