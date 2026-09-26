@@ -60,7 +60,13 @@ uv run uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8765
 
 LAN内の端末から http://mymac.local:8765 を開きます。`!` はbash/zshの履歴展開と衝突するため（ダブルクォート内でも展開されます）、`DLNA_ALLOWED_CLIENTS` の値はシングルクォートで囲んでください。
 
-全インターフェース（`0.0.0.0`）ではなくLAN側IPだけで待ち受ける場合は、デフォルトルートのインターフェースからIPを取得して指定します:
+同じことを `launch.sh` で行えます（`-name` 省略時はMacのローカルホスト名、`-allowip` 省略時はLANサブネットを許可してルーターを除外、`-token` 省略時は入力を求めます）:
+
+```bash
+./launch.sh -name mymac -allowip '192.168.1.0/24,!192.168.1.1'
+```
+
+手動で指定する場合、全インターフェース（`0.0.0.0`）ではなくLAN側IPだけで待ち受けるには、デフォルトルートのインターフェースからIPを取得して指定します:
 
 ```bash
 LAN_IP=$(ipconfig getifaddr "$(route -n get default | awk '/interface:/{print $2}')") && echo "LAN IP: $LAN_IP" && \
