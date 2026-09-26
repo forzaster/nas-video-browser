@@ -59,6 +59,20 @@ uv run uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8765
 ```
 
 LAN内の端末から http://mymac.local:8765 を開きます。`!` はbash/zshの履歴展開と衝突するため（ダブルクォート内でも展開されます）、`DLNA_ALLOWED_CLIENTS` の値はシングルクォートで囲んでください。
+
+全インターフェース（`0.0.0.0`）ではなくLAN側IPだけで待ち受ける場合は、デフォルトルートのインターフェースからIPを取得して指定します:
+
+```bash
+LAN_IP=$(ipconfig getifaddr "$(route -n get default | awk '/interface:/{print $2}')") && echo "LAN IP: $LAN_IP" && \
+DLNA_TOKEN="自分で決めた長いトークン" \
+DLNA_ALLOWED_HOSTS="$LAN_IP,mymac.local" \
+DLNA_ALLOWED_CLIENTS='192.168.1.0/24,!192.168.1.1' \
+DLNA_INTERFACE="$LAN_IP" \
+uv run uvicorn app.main:create_app --factory --host "$LAN_IP" --port 8765
+```
+
+この場合 `localhost` では開けないため、Mac自身からも http://mymac.local:8765 などで開きます（Mac自身の接続もLAN IPからの扱いになり、ログインが必要です）。
+VPN接続中はデフォルトルートがVPN側になり、IPが取得できないか意図しないアドレスになることがあります。DHCPでIPが変わると再起動が必要なので、ルーターでIPを固定しておくと安心です。
 ブラウザのログインフォームに同じトークンを入力してください。これは家庭内LAN向けです。インターネットへ直接公開する構成ではありません。
 SSDPの送信インターフェースを固定する場合は `DLNA_INTERFACE` にMacのLAN側IPv4アドレスを指定します。
 `FFMPEG` / `FFPROBE`で実行ファイルのパスを指定できます。
