@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Family Videos</title><link rel="stylesheet" href="/static/style.css"><script defer src="/static/app.js"></script></head>
+<body><header><span class="eyebrow">YOUR HOME VIDEO LIBRARY</span><h1>Family Videos</h1>
+<p>思い出を、年とアルバムから。</p></header>
+<section class="toolbar" aria-label="機器設定">
+<button id="discover">機器を検索</button><label>MediaServer<select id="server"><option value="">選択してください</option></select></label>
+<button id="crawl">再クロール</button><label>再生先<select id="renderer"><option value="">ブラウザ（MP4）</option></select></label>
+<details><summary>機器URLを指定</summary><form id="add"><input id="location" type="url" required placeholder="http://…/description.xml" aria-label="機器説明URL"><button>登録</button></form></details>
+</section>
+<form id="login" hidden><label>アクセストークン <input id="token" type="password" required></label><button>ログイン</button></form>
+<p id="message" role="status"></p><p id="crawl-status" role="status"></p>
+<nav id="breadcrumbs" aria-label="階層"></nav><main id="content"><p class="empty">MediaServerを選択すると、クローラーが動画を取得します。</p></main>
+<section id="player"><strong id="now">動画を選択してください</strong><video id="video" controls hidden></video>
+<div class="controls"><button id="play">再生</button><button id="pause">一時停止</button><button id="stop">停止</button><label><input id="repeat" type="checkbox" checked>最後まで再生したら繰り返す（開始時に適用）</label></div></section>
+<dialog id="edit"><form id="title-form"><h2>タイトルを編集</h2><p id="original"></p><input id="title" maxlength="300" aria-label="新しいタイトル"><p>空欄で保存すると元のタイトルに戻ります。</p><button type="button" id="cancel">キャンセル</button><button>保存</button></form></dialog>
+</body></html>
