@@ -72,13 +72,13 @@ function render() {
     const duration=(r?.duration||'').split('.')[0];
     if(duration)cover.append(el('span',duration,'badge duration'));
     if(playing)cover.append(el('span','再生中','badge now-badge'));
-    const body=el('div',undefined,'card-body');body.append(el('h3',item.title));
+    const body=el('div',undefined,'card-body'), heading=el('div',undefined,'title-row');heading.append(el('h3',item.title));body.append(heading);
     if(r)body.append(el('p',[r.resolution,r.mime,duration].filter(Boolean).join(' / '),'meta'));
     if(item.custom_title)body.append(el('p',item.source_title,'meta source'));
     if(item.thumb_error)body.append(el('p','サムネイル生成失敗。再クロールで再試行します。','warn'));
-    const edit=el('button','タイトル編集','edit-button');edit.type='button';
+    const edit=el('button',undefined,'edit-button');edit.type='button';edit.title='タイトルを編集';edit.setAttribute('aria-label',item.title+'のタイトルを編集');
     edit.onclick=()=>{editId=item.id;$('original').textContent='元の名前: '+item.source_title;$('title').value=item.custom_title||'';$('edit').showModal();};
-    body.append(edit);card.append(cover,body);grid.append(card);}
+    heading.append(edit);card.append(cover,body);grid.append(card);}
 }
 async function stop(){ $('video').pause();$('video').hidden=true; if(activeRenderer)await api('/renderers/'+enc(activeRenderer)+'/stop','POST');activeRenderer='';playingId=null;$('now').textContent='停止';render(); }
 async function start(id,items){await stop();items=media.filter(m=>m.year===items.find(i=>i.id===id).year);queue=items;index=items.findIndex(m=>m.id===id);activeRenderer=$('renderer').value;
