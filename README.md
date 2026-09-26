@@ -109,11 +109,14 @@ SSDPの送信インターフェースを固定する場合は `DLNA_INTERFACE` �
 ## 常駐させる（LaunchAgent）
 
 `install-daemon.sh` で `launch.sh` をLaunchAgentとして登録すると、ログイン時に自動起動し、異常終了時も再起動します。
-トークンは入力を求め、本人のみ読める設定ファイル（`~/Library/LaunchAgents/local.webvideo.plist`）に保存します。
+ホスト名・許可する接続元・ポート・データの保存先・トークンを対話で聞き（Enterで既定値）、内容を確認してから登録します。
+トークンは本人のみ読める設定ファイル（`~/Library/LaunchAgents/local.webvideo.plist`）に保存します。管理者トークンを空欄にすると自動生成して表示します。
 
 ```bash
-./install-daemon.sh -name mymac -allowip '192.168.1.0/24,!192.168.1.1'
+./install-daemon.sh
 ```
+
+オプション（`-name` / `-allowip` / `-port` / `-data`）で指定した項目は聞かれません。`-y` で質問せず既定値で登録します（管理者トークンは環境変数 `DLNA_ADMIN_TOKEN` で渡します）。
 
 - データの保存先は既定で `~/Library/Application Support/webvideo`（`-data`で変更）。空なら `./data` をコピーして引き継ぎます。
 - `./install-daemon.sh status` / `restart`（コード更新後）/ `logs` / `uninstall`。`-dry-run` で登録せずに設定を確認できます。
