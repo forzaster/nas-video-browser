@@ -977,3 +977,122 @@ def test_guest_cannot_plan_or_queue_hidden_items(tmp_path, monkeypatch):
         for path in ("plan", "queue"):
             assert client.post(f"/api/renderers/uuid:tv/{path}", headers=GUEST, json={"ids": [id]}).status_code == 404
             assert client.post(f"/api/renderers/uuid:tv/{path}", headers=ADMIN, json={"ids": [id]}).status_code == 200
+
+
+def test_last_synced_only_after_a_successful_scan(tmp_path, monkeypatch):
+    db = Catalog(tmp_path)
+    fake_thumbnails(monkeypatch, [])
+    db.device(SERVER)
+    last = lambda: db.get_device(SERVER["id"])["last_synced"]
+    assert crawl(db, FakeNetwork(items("a"), fail=True))["state"] == "failed" and last() is None
+    assert crawl(db, FakeNetwork([]))["state"] == "failed" and last() is None
+    gate = asyncio.Event()  # never set: the scan blocks on the second item until cancelled
+    async def cancelled():
+        crawler = Crawler(db, FakeNetwork(items("a", "b"), gate=gate))
+        crawler.start(SERVER)
+        await asyncio.sleep(0.01)
+        crawler.tasks[SERVER["id"]].cancel()
+        await asyncio.gather(crawler.tasks[SERVER["id"]], return_exceptions=True)
+        return crawler.status[SERVER["id"]]["state"]
+    assert asyncio.run(cancelled()) == "interrupted" and last() is None
+    assert crawl(db, FakeNetwork(items("a")))["state"] == "complete"
+    synced = last()
+    assert synced.endswith("+00:00") and Crawler.sync_info(db.get_device(SERVER["id"]), 7)["last_synced"] == synced
+    db.device({**SERVER, "name": "renamed"})  # discovery upsert keeps it
+    assert last() == synced
+
+
+def test_devices_migration_adds_last_synced(tmp_path):
+    import sqlite3
+    with sqlite3.connect(tmp_path / "catalog.sqlite3") as conn:
+        conn.execute("CREATE TABLE devices (id TEXT PRIMARY KEY, name TEXT NOT NULL, location TEXT NOT NULL,"
+                     " kind TEXT NOT NULL, model TEXT, seen TEXT DEFAULT CURRENT_TIMESTAMP,"
+                     " crawl_root TEXT, crawl_root_title TEXT)")
+        conn.execute("INSERT INTO devices(id,name,location,kind) VALUES('uuid:server','n','http://x','server')")
+    db = Catalog(tmp_path)
+    assert db.get_device(SERVER["id"])["last_synced"] is None
+    db.synced(SERVER["id"], "2026-01-01T00:00:00+00:00")
+    assert Catalog(tmp_path).get_device(SERVER["id"])["last_synced"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_sync_days_parsing():
+    from app.jobs import sync_days
+    assert [sync_days(v) for v in (None, "", "x", "-1", "nan", "inf", "0", "0.5", "3")] == [7, 7, 7, 7, 7, 7, 0, 0.5, 3]
+
+
+def sync_app(tmp_path, monkeypatch, days=None, last_synced=None):
+    if days is not None:
+        monkeypatch.setenv("DLNA_AUTO_SYNC_DAYS", days)
+    else:
+        monkeypatch.delenv("DLNA_AUTO_SYNC_DAYS", raising=False)
+    network = FakeNetwork(items("a"))
+    app = create_app(tmp_path, network)
+    app.state.catalog.device(SERVER)
+    if last_synced:
+        app.state.catalog.synced(SERVER["id"], last_synced)
+    return app, network
+
+
+def ago(days):
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+
+
+def test_auto_sync_within_interval_does_not_start(tmp_path, monkeypatch):
+    last = ago(3)
+    app, network = sync_app(tmp_path, monkeypatch, last_synced=last)
+    with TestClient(app, **LOCAL) as client:
+        state = client.post("/api/servers/uuid:server/crawl?auto=true", headers=HEADERS).json()
+        assert state["state"] == "idle" and state["last_synced"] == last
+        assert state["next_auto"][:10] == ago(-4)[:10]
+        assert network.calls == 0 and not app.state.crawler.tasks
+        assert client.get("/api/servers/uuid:server/crawl").json()["next_auto"] == state["next_auto"]
+
+
+def run_crawl(client, app, query=""):
+    state = client.post("/api/servers/uuid:server/crawl" + query, headers=HEADERS).json()
+    task = app.state.crawler.tasks.get(SERVER["id"])
+    if task:
+        client.portal.call(lambda: asyncio.wait_for(asyncio.shield(task), 5))
+    return state
+
+
+def test_auto_sync_starts_when_due_or_never_synced(tmp_path, monkeypatch):
+    fake_thumbnails(monkeypatch, [])
+    for path, last in (("old", ago(8)), ("never", None)):
+        app, network = sync_app(tmp_path / path, monkeypatch, last_synced=last)
+        with TestClient(app, **LOCAL) as client:
+            assert run_crawl(client, app, "?auto=true")["state"] == "scanning"
+            assert network.calls == 1
+            state = client.get("/api/servers/uuid:server/crawl").json()
+            assert state["state"] == "complete" and state["last_synced"] != last
+            assert run_crawl(client, app, "?auto=true")["state"] == "complete" and network.calls == 1  # now fresh
+
+
+def test_manual_sync_always_starts_and_auto_attaches(tmp_path, monkeypatch):
+    fake_thumbnails(monkeypatch, [])
+    app, network = sync_app(tmp_path, monkeypatch, last_synced=ago(0))
+    gate = network.gate = asyncio.Event()
+    network.sources = items("a", "b")
+    with TestClient(app, **LOCAL) as client:
+        first = client.post("/api/servers/uuid:server/crawl", headers=HEADERS).json()
+        task = app.state.crawler.tasks[SERVER["id"]]
+        assert first["state"] == "scanning" and not task.done()
+        attached = client.post("/api/servers/uuid:server/crawl?auto=true", headers=HEADERS).json()
+        assert attached["state"] == "scanning" and app.state.crawler.tasks[SERVER["id"]] is task
+        client.portal.call(gate.set)
+        client.portal.call(lambda: asyncio.wait_for(asyncio.shield(task), 5))
+        assert network.calls == 1
+        assert run_crawl(client, app)["state"] == "scanning" and network.calls == 2  # manual: even when fresh
+
+
+def test_auto_sync_disabled_with_zero_days(tmp_path, monkeypatch):
+    fake_thumbnails(monkeypatch, [])
+    app, network = sync_app(tmp_path, monkeypatch, days="0")
+    with TestClient(app, **LOCAL) as client:
+        state = client.post("/api/servers/uuid:server/crawl?auto=1", headers=HEADERS).json()
+        assert (state["state"], state["last_synced"], state["next_auto"]) == ("idle", None, None)
+        assert network.calls == 0
+    app, network = sync_app(tmp_path / "custom", monkeypatch, days="0.5", last_synced=ago(1))
+    with TestClient(app, **LOCAL) as client:
+        assert run_crawl(client, app, "?auto=true")["state"] == "scanning" and network.calls == 1

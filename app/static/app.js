@@ -134,7 +134,7 @@ function render() {
     const body=el('div',undefined,'card-body'), heading=el('div',undefined,'title-row');heading.append(el('h3',item.title));body.append(heading);
     if(r)body.append(el('p',[r.resolution,r.mime,duration].filter(Boolean).join(' / '),'meta'));
     if(item.custom_title)body.append(el('p',item.source_title,'meta source'));
-    if(item.thumb_error)body.append(el('p','サムネイル生成失敗。再クロールで再試行します。','warn'));
+    if(item.thumb_error)body.append(el('p','サムネイル生成失敗。次回の同期で再試行します。','warn'));
     if(isAdmin()){const edit=el('button',undefined,'edit-button');edit.type='button';edit.title='タイトルを編集';edit.setAttribute('aria-label',item.title+'のタイトルを編集');
       edit.onclick=()=>{editId=item.id;$('original').textContent='元の名前: '+item.source_title;$('title').value=item.custom_title||'';$('edit').showModal();};
       heading.append(edit,hideButton(item.title,!!item.hidden,'/media/'+enc(item.id)+'/hidden'));}
@@ -248,12 +248,14 @@ $('discover').onclick=action(async()=>{$('discover').disabled=true;try{const res
 $('add').onsubmit=action(async e=>{e.preventDefault();await api('/devices','POST',{url:$('location').value});await devices();});
 // Starting is idempotent on the server: a running crawl is joined, never duplicated or cancelled.
 // Switching servers only changes what is displayed; other crawls keep running in the background.
-async function startCrawl(){const server=$('server').value;const state=await api('/servers/'+enc(server)+'/crawl','POST');if(server===$('server').value){showCrawl(state);scanWasRunning=true;}return state;}
+// auto=true (page load / server selection) only syncs when the last sync is older than DLNA_AUTO_SYNC_DAYS.
+async function startCrawl(auto=false){const server=$('server').value;const state=await api('/servers/'+enc(server)+'/crawl'+(auto?'?auto=true':''),'POST');
+  if(server===$('server').value){showCrawl(state);if(isRunning(state))scanWasRunning=true;}return state;}
 // The last selected MediaServer is remembered per browser (storage may be unavailable, e.g. private mode).
 const savedServer={get(){try{return localStorage.getItem('dlna.server')||'';}catch{return '';}},set(v){try{localStorage.setItem('dlna.server',v);}catch{}}};
-async function selectServer(){year=null;album=null;showCrawl(null);await refresh();if($('server').value)await startCrawl();}
+async function selectServer(){year=null;album=null;showCrawl(null);await refresh();if($('server').value)await startCrawl(true);}
 $('server').onchange=action(async()=>{savedServer.set($('server').value);await selectServer();});
-$('crawl').onclick=action(async()=>{if(!$('server').value)throw new Error('MediaServerを選択してください');await startCrawl();});
+$('crawl').onclick=action(async()=>{if(!$('server').value)throw new Error('MediaServerを選択してください');await startCrawl();});  // manual: always syncs
 // Admin-only source-folder picker: browse containers, then pin one (or return to auto-detection).
 let rootPath = [], rootVersion = 0;
 const rootLabel = r => (r.auto ? '自動: ' : '手動: ') + r.title;
@@ -274,7 +276,7 @@ async function loadRoot(){const server=$('server').value, here=rootPath.at(-1), 
   finally{if(version===rootVersion)list.setAttribute('aria-busy','false');}}
 async function saveRoot(body){const server=$('server').value;await api('/servers/'+enc(server)+'/crawl-root','PUT',body);$('root-dialog').close();
   const state=await startCrawl();
-  if(state&&state.root&&(body.id?state.root.id!==body.id||state.root.auto:!state.root.auto))message('実行中のクロールが終わった後に「再クロール」すると、新しい取得元が使われます。');}
+  if(state&&state.root&&(body.id?state.root.id!==body.id||state.root.auto:!state.root.auto))message('実行中の取得が終わった後に「同期」すると、新しい取得元が使われます。');}
 $('root-open').onclick=action(async()=>{const server=$('server').value;if(!server)throw new Error('MediaServerを選択してください');
   const info=await api('/servers/'+enc(server)+'/crawl-root');
   $('root-mode').textContent='現在の設定 — '+(info.id?rootLabel({auto:false,title:info.title}):info.last?.auto?rootLabel(info.last):'自動（次回のクロールで判定）');
@@ -297,18 +299,30 @@ async function boot(){const me=await api('/me');role=me.role;
   $('show-hidden-wrap').hidden=!isAdmin();$('root-open').hidden=!isAdmin();$('add').closest('details').hidden=!isAdmin();if(!isAdmin())$('show-hidden').checked=false;
   await devices();const saved=savedServer.get();
   if(saved&&!$('server').value&&[...$('server').options].some(o=>o.value===saved)){$('server').value=saved;await selectServer();}else await refresh();}
-const crawlLabels={idle:'待機',scanning:'動画を取得中',thumbnails:'サムネイル生成中',complete:'クロール完了',failed:'クロール失敗',interrupted:'中断'};
+const crawlLabels={idle:'待機',scanning:'動画を取得中',thumbnails:'サムネイル生成中',complete:'同期完了',failed:'同期失敗',interrupted:'中断'};
 const isRunning=state=>!!state&&['scanning','thumbnails'].includes(state.state);
+function ago(iso){const s=Math.max(0,(Date.now()-Date.parse(iso))/1000);
+  return s<60?'たった今':s<3600?Math.floor(s/60)+'分前':s<86400?Math.floor(s/3600)+'時間前':Math.floor(s/86400)+'日前';}
+function stamp(iso,year){const d=new Date(iso),p=n=>String(n).padStart(2,'0');
+  return (year?d.getFullYear()+'/':'')+(d.getMonth()+1)+'/'+d.getDate()+' '+p(d.getHours())+':'+p(d.getMinutes());}
+function syncNote(state){return [state.last_synced?'最終同期: '+stamp(state.last_synced,true):'',
+  !state.next_auto?'自動同期はオフ':state.last_synced?'次回の自動同期: '+stamp(state.next_auto)+'以降':'次回ページを開いたときに自動同期します'].filter(Boolean);}
 function showCrawl(state){const status=$('crawl-status'),button=$('crawl'),running=isRunning(state);
-  if(state){const parts=[crawlLabels[state.state]||state.state,state.count+' 本'];
-    if(state.count)parts[1]+='（新規 '+state.new+(state.updated?'・更新 '+state.updated:'')+'・既存 '+state.skipped+'）';
-    if(state.thumbs_total)parts.push('サムネイル '+state.thumbnails+'/'+state.thumbs_total);
+  if(state){const synced=state.last_synced?'最終同期 '+ago(state.last_synced):'未同期',parts=[];
+    // While running: progress. Otherwise: last sync (plus the outcome of a crawl run since the server started).
+    if(running||['failed','interrupted'].includes(state.state))parts.push(crawlLabels[state.state]||state.state);
+    if(!running)parts.push(synced);
+    if(state.state!=='idle'){parts.push(state.count+' 本');
+      if(state.count)parts[parts.length-1]+='（新規 '+state.new+(state.updated?'・更新 '+state.updated:'')+'・既存 '+state.skipped+'）';}
+    if(running&&state.thumbs_total)parts.push('サムネイル '+state.thumbnails+'/'+state.thumbs_total);
     if(state.errors.length)parts.push('エラー '+state.errors.length+' 件');
-    status.textContent=parts.join(' · ');status.title=[isAdmin()&&state.root?'取得元 '+rootLabel(state.root):'',...state.errors].filter(Boolean).join('\n');status.dataset.state=state.state;}
+    status.textContent=parts.join(' · ');
+    status.title=[...syncNote(state),isAdmin()&&state.root?'取得元 '+rootLabel(state.root):'',...state.errors].filter(Boolean).join('\n');
+    status.dataset.state=state.state==='idle'&&state.last_synced?'complete':state.state;}
   else{status.textContent='';status.title='';delete status.dataset.state;}
   status.setAttribute('aria-busy',running);$('server-spinner').hidden=!running;
-  button.textContent=running?'取得中…':'再クロール';button.classList.toggle('busy',running);button.setAttribute('aria-busy',running);
-  button.title=running?'バックグラウンドで取得中です（押しても重複して実行されません）':'';}
+  button.textContent=running?'取得中…':'同期';button.classList.toggle('busy',running);button.setAttribute('aria-busy',running);
+  button.title=running?'バックグラウンドで取得中です（押しても重複して実行されません）':'NASから動画一覧を今すぐ取得';}
 async function poll(){try{
   const server=$('server').value;
   if(server){const state=await api('/servers/'+enc(server)+'/crawl');

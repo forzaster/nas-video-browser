@@ -44,7 +44,8 @@ class Catalog:
                 CREATE TABLE IF NOT EXISTS devices (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, location TEXT NOT NULL,
                     kind TEXT NOT NULL, model TEXT, seen TEXT DEFAULT CURRENT_TIMESTAMP,
-                    crawl_root TEXT, crawl_root_title TEXT  -- NULL = auto-detect at each crawl
+                    crawl_root TEXT, crawl_root_title TEXT,  -- NULL = auto-detect at each crawl
+                    last_synced TEXT  -- UTC ISO 8601 of the last successful tree scan
                 );
                 CREATE TABLE IF NOT EXISTS media (
                     id TEXT PRIMARY KEY, server_id TEXT NOT NULL, object_id TEXT NOT NULL,
@@ -65,7 +66,7 @@ class Catalog:
             if "hidden" not in {r["name"] for r in db.execute("PRAGMA table_info(media)")}:
                 db.execute("ALTER TABLE media ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
             columns = {r["name"] for r in db.execute("PRAGMA table_info(devices)")}
-            for name in ("crawl_root", "crawl_root_title"):
+            for name in ("crawl_root", "crawl_root_title", "last_synced"):
                 if name not in columns:
                     db.execute(f"ALTER TABLE devices ADD COLUMN {name} TEXT")
 
@@ -90,6 +91,10 @@ class Catalog:
         with self.connect() as db:
             db.execute("UPDATE devices SET crawl_root=?,crawl_root_title=? WHERE id=?",
                        (root, (title or root) if root else None, id))
+
+    def synced(self, id, when):
+        with self.connect() as db:
+            db.execute("UPDATE devices SET last_synced=? WHERE id=?", (when, id))
 
     def devices(self):
         with self.connect() as db:

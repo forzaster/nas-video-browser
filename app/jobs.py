@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 import os
+import math
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from async_upnp_client.exceptions import UpnpActionError
@@ -27,6 +29,26 @@ def env_int(name, default):
         return max(1, int(os.getenv(name, "")))
     except ValueError:
         return default
+
+
+AUTO_SYNC_DAYS = 7
+
+
+def sync_days(value):
+    """DLNA_AUTO_SYNC_DAYS: days between automatic syncs (float, 0 = never); invalid -> default."""
+    try:
+        days = float(value)
+    except (TypeError, ValueError):
+        return AUTO_SYNC_DAYS
+    return min(days, 36500) if days >= 0 and math.isfinite(days) else AUTO_SYNC_DAYS  # cap: date overflow
+
+
+def utc(value):
+    try:
+        moment = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 
 # Defaults for DLNA_FFMPEG_JOBS / DLNA_THUMB_WORKERS, measured against a LinkStation: 4 workers x 4 frames
@@ -154,9 +176,24 @@ class Crawler:
     def state(self, id):
         return self.status.get(id) or crawl_status()
 
+    def running(self, id):
+        return id in self.tasks and not self.tasks[id].done()
+
+    @staticmethod
+    def sync_info(device, days):
+        """last_synced / next_auto (None when auto sync is off; now when it has never synced)."""
+        last = utc(device.get("last_synced"))
+        next_auto = None if not days else last + timedelta(days=days) if last else datetime.now(timezone.utc)
+        return {"last_synced": last and last.isoformat(timespec="seconds"),
+                "next_auto": next_auto and next_auto.isoformat(timespec="seconds")}
+
+    def auto_due(self, device, days):
+        next_auto = self.sync_info(device, days)["next_auto"]
+        return bool(next_auto) and datetime.now(timezone.utc) >= utc(next_auto)
+
     def start(self, device):
         id = device["id"]
-        if id in self.tasks and not self.tasks[id].done():
+        if self.running(id):
             return self.status[id]
         self.status[id] = crawl_status("scanning")
         self.tasks[id] = asyncio.create_task(self.crawl(device))
@@ -211,6 +248,7 @@ class Crawler:
                 raise ValueError(NOTHING_FOUND)
             # Only after the entire tree succeeded. Failed crawls never hide existing media.
             self.catalog.finish_scan(device["id"], ids)
+            self.catalog.synced(device["id"], datetime.now(timezone.utc).isoformat(timespec="seconds"))
             status["state"] = "thumbnails"
             await queue.join()
             status["state"] = "complete"
@@ -316,7 +354,7 @@ class Player:
     async def load_track(self, device, state):
         item = self.catalog.get(state["queue"][state["index"]])
         if not item or not item["available"]:
-            raise ValueError("動画が見つかりません。再クロールしてください")
+            raise ValueError("動画が見つかりません。同期してください")
         resource = preferred(item, sinks=(await self.capabilities(device))["sinks"])
         if not resource:
             raise Unplayable(f"{device.get('name') or '再生先'}が対応していない形式です")
