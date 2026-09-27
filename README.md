@@ -113,6 +113,7 @@ SSDPの送信インターフェースを固定する場合は `DLNA_INTERFACE` �
 ## 常駐させる（LaunchAgent）
 
 `install-daemon.sh` で `launch.sh` をLaunchAgentとして登録すると、ログイン時に自動起動し、異常終了時も再起動します。
+「システム設定 → 一般 → ログイン項目と機能拡張」のバックグラウンド項目には `FamilyVideos`（`bin/FamilyVideos`、`launch.sh` を呼ぶだけの入口）と表示されます。
 ホスト名・許可する接続元・ポート・データの保存先・トークンを対話で聞き（Enterで既定値）、内容を確認してから登録します。
 トークンは本人のみ読める設定ファイル（`~/Library/LaunchAgents/local.webvideo.plist`）に保存します。管理者トークンを空欄にすると自動生成して表示します。
 
