@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .catalog import Catalog
-from .jobs import Crawler, Player, Unplayable
+from .jobs import Crawler, Player, Unplayable, sync_days
 from .upnp import Network
 
 log = logging.getLogger(__name__)
@@ -133,6 +133,7 @@ def create_app(directory=None, network=None):
     clients = client_rules(os.getenv("DLNA_ALLOWED_CLIENTS"))
     admin_token, guest_token = tokens()
     catalog = Catalog(directory or os.getenv("DLNA_DATA", "data"))
+    auto_days = sync_days(os.getenv("DLNA_AUTO_SYNC_DAYS"))
     network = network or Network()
     crawler, player = Crawler(catalog, network), Player(catalog, network)
 
@@ -241,14 +242,20 @@ def create_app(directory=None, network=None):
             catalog.device(item)
         return results
 
+    def crawl_status(server):
+        return {**crawler.state(server["id"]), **crawler.sync_info(server, auto_days)}
+
     @app.post("/api/servers/{id}/crawl")
-    async def crawl(id: str):
-        return crawler.start(device(id, "server"))
+    async def crawl(id: str, auto: bool = False):
+        """Manual (default) always starts or joins; auto=true only when the sync is due (page load)."""
+        server = device(id, "server")
+        if not auto or crawler.running(id) or crawler.auto_due(server, auto_days):
+            crawler.start(server)
+        return crawl_status(server)
 
     @app.get("/api/servers/{id}/crawl")
     def crawl_state(id: str):
-        device(id, "server")
-        return crawler.state(id)
+        return crawl_status(device(id, "server"))
 
     @app.get("/api/servers/{id}/containers", dependencies=[Depends(require_admin)])
     async def containers(id: str, parent: str = Query("0", min_length=1, max_length=1024)):
