@@ -125,6 +125,7 @@ SSDPの送信インターフェースを固定する場合は `DLNA_INTERFACE` �
 
 - データの保存先は既定で `~/Library/Application Support/webvideo`（`-data`で変更）。空なら `./data` をコピーして引き継ぎます。
 - `./install-daemon.sh status` / `restart`（コード更新後）/ `logs` / `uninstall`。`-dry-run` で登録せずに設定を確認できます。
+- クロールやサムネイル生成の失敗は `logs`（`~/Library/Logs/webvideo.log`）に `crawl failed` / `thumbnail failed` として出力されます。
 - 初回は「FamilyVideos」がローカルネットワークへのアクセス許可を求めます。許可しないと機器検索・NAS・テレビへの接続が `No route to host` で失敗します（システム設定 → プライバシーとセキュリティ → ローカルネットワーク で変更できます）。起動用アプリのソースを変えない限り、再登録しても許可は保たれます。
 - ログインしている間だけ動きます。画面なしで運用するMacでは自動ログインを有効にしてください。
 - 手動で起動したサーバーが同じポートを使っていると登録できません。先に止めてください。
