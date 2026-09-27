@@ -170,6 +170,24 @@ if $dry; then
   exit 0
 fi
 
+# 登録済みなら、今の設定のポート（-port の次の引数）。自分のサーバーが使っているポートは使用中とみなさない
+current_port=""
+if loaded && [ -e "$PLIST" ]; then
+  current_port=$(plutil -extract ProgramArguments json -o - "$PLIST" 2>/dev/null |
+    python3 -c 'import json,sys; a=json.load(sys.stdin); print(a[a.index("-port")+1] if "-port" in a[:-1] else "")' 2>/dev/null || true)
+fi
+if [ "$port" != "$current_port" ] && lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "ポート $port は既に使われています。手動で起動したサーバーなどを止めるか、別のポートを指定してください" >&2
+  exit 1
+fi
+
+# 起動に使う環境が壊れていないか（プロジェクト移動後の古い .venv など）を登録前に確認する
+if ! (cd "$ROOT" && PATH="$path_dirs" uv run --frozen uvicorn --version >/dev/null 2>&1); then
+  echo "uvicorn を起動できません。次を実行してから再度登録してください:" >&2
+  echo "  (cd \"$ROOT\" && uv sync --locked --reinstall)" >&2
+  exit 1
+fi
+
 if [ ! -e "$data/catalog.sqlite3" ] && [ -e "$ROOT/data/catalog.sqlite3" ]; then
   mkdir -p "$data"
   cp -Rn "$ROOT/data/." "$data/"
@@ -177,14 +195,20 @@ if [ ! -e "$data/catalog.sqlite3" ] && [ -e "$ROOT/data/catalog.sqlite3" ]; then
 fi
 mkdir -p "$data" "$(dirname "$PLIST")" "$(dirname "$LOG")"
 
-if ! loaded && lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "注意: ポート $port は既に使われています。手動で起動したサーバーを止めてから再実行してください" >&2
+# 登録済みなら外し、launchd から消えるまで待つ（残ったままだと bootstrap が失敗する）
+if loaded; then
+  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do loaded || break; sleep 1; done
+  if loaded; then
+    echo "登録済みの $LABEL を停止できませんでした。./install-daemon.sh uninstall を実行してから再度登録してください" >&2
+    exit 1
+  fi
+fi
+write_plist "$PLIST" "$admin" "$guest"
+if ! launchctl bootstrap "$DOMAIN" "$PLIST"; then
+  echo "launchd への登録に失敗しました。./install-daemon.sh uninstall を実行してから再度登録してください" >&2
   exit 1
 fi
-
-loaded && launchctl bootout "$DOMAIN/$LABEL" && sleep 1
-write_plist "$PLIST" "$admin" "$guest"
-launchctl bootstrap "$DOMAIN" "$PLIST"
 
 echo "登録して起動しました: $LABEL"
 $generated && echo "  管理者トークン（ログインに使います。控えてください）: $admin"
