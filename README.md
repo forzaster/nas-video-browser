@@ -125,6 +125,7 @@ SSDPの送信インターフェースを固定する場合は `DLNA_INTERFACE` �
 
 - データの保存先は既定で `~/Library/Application Support/webvideo`（`-data`で変更）。空なら `./data` をコピーして引き継ぎます。
 - `./install-daemon.sh status` / `restart`（コード更新後）/ `logs` / `uninstall`。`-dry-run` で登録せずに設定を確認できます。
+- クロールやサムネイル生成の失敗は `logs`（`~/Library/Logs/webvideo.log`）に `crawl failed` / `thumbnail failed` として出力されます。
 - 初回はローカルネットワークへのアクセス許可を求められることがあります。許可しないと機器検索やNASへの接続が失敗します。
 - ログインしている間だけ動きます。画面なしで運用するMacでは自動ログインを有効にしてください。
 - 手動で起動したサーバーが同じポートを使っていると登録できません。先に止めてください。
