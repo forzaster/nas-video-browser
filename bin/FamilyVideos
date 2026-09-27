@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# LaunchAgent から起動する入口。システム設定の「バックグラウンドでの実行を許可」にはこのファイル名が表示される。
+exec "$(cd "$(dirname "$0")/.." && pwd)/launch.sh" "$@"

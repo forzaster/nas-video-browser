@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # launch.sh をログイン時に自動起動する LaunchAgent（launchd）として登録・管理する。
+# 起動は bin/FamilyVideos（launch.sh を呼ぶだけ）経由。システム設定のバックグラウンド項目にはこの名前で表示される。
 set -euo pipefail
 
 usage() {
@@ -152,7 +153,7 @@ env = {"PATH": e["PL_PATH"], "DLNA_DATA": e["PL_DATA"], "DLNA_ADMIN_TOKEN": e["P
 if e["PL_GUEST"]:
     env["DLNA_GUEST_TOKEN"] = e["PL_GUEST"]
 with open(e["PL_OUT"], "wb") as f:
-    plistlib.dump({"Label": e["PL_LABEL"], "ProgramArguments": [e["PL_ROOT"] + "/launch.sh", *sys.argv[1:]],
+    plistlib.dump({"Label": e["PL_LABEL"], "ProgramArguments": [e["PL_ROOT"] + "/bin/FamilyVideos", *sys.argv[1:]],
                    "WorkingDirectory": e["PL_ROOT"], "EnvironmentVariables": env,
                    "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 30,
                    "StandardOutPath": e["PL_LOG"], "StandardErrorPath": e["PL_LOG"]}, f)
