@@ -9,7 +9,7 @@ from async_upnp_client.exceptions import UpnpActionError
 from fastapi.testclient import TestClient
 
 from app.catalog import Catalog, display_title, year_for
-from app.jobs import THUMB_WORKERS, Crawler, Player, make_thumbnail, process_slots, run_process
+from app.jobs import THUMB_WORKERS, Crawler, Player, frame_time, make_thumbnail, process_slots, run_process
 from app.main import create_app
 from app.upnp import Network, parse_didl, parse_protocols, preferred
 
@@ -147,6 +147,60 @@ def test_failed_frame_cancels_the_others_and_cleans_up(tmp_path, monkeypatch):
         asyncio.run(asyncio.wait_for(make_thumbnail(db, row), 5))
     assert len(cancelled) == 3 and list(db.thumbs.iterdir()) == []
     assert db.get(row["id"])["thumb_error"] == "frame broken"
+
+
+def test_frame_time_stays_clear_of_the_end():
+    assert frame_time(100, 0.9) == 90
+    assert frame_time(2, 0.9) == 1  # DIDL "0:00:02" for a 1.5s clip: 1.8s would be past the last frame
+    assert frame_time(0.8, 0.9) == 0 and frame_time(0, 0.5) == 0
+
+
+def test_seek_without_a_frame_retries_from_the_start(tmp_path, monkeypatch):
+    db = Catalog(tmp_path)
+    row = db.get(db.upsert(SERVER["id"], item()))
+    seeks = []
+    async def process(*args, timeout=90):
+        if args[0] == "ffprobe":
+            return b'{"format": {"duration": "100"}}'
+        if "-filter_complex" in args:
+            Path(args[-1]).write_bytes(b"jpg")
+            return b""
+        at = float(args[args.index("-ss") + 1])
+        seeks.append(at)
+        if at == 0:  # only the start yields a frame, like a clip shorter than its listed duration
+            Path(args[-1]).write_bytes(b"part")
+        elif at > 50:
+            raise RuntimeError("Error while opening encoder")
+        return b""
+    monkeypatch.setattr("app.jobs.run_process", process)
+    assert asyncio.run(make_thumbnail(db, row)) is True
+    assert seeks.count(0) == 4 and db.get(row["id"])["thumb_error"] is None
+
+
+def test_frame_that_never_appears_is_reported(tmp_path, monkeypatch):
+    db = Catalog(tmp_path)
+    row = db.get(db.upsert(SERVER["id"], item()))
+    async def frame(part):  # FFmpeg exits 0 but writes nothing
+        return b""
+    fake_ffmpeg(monkeypatch, frame)
+    with pytest.raises(RuntimeError, match="フレームを取得できませんでした"):
+        asyncio.run(make_thumbnail(db, row))
+    assert "フレーム" in db.get(row["id"])["thumb_error"] and list(db.thumbs.iterdir()) == []
+
+
+def test_thumbnail_failures_are_logged(tmp_path, monkeypatch, caplog):
+    db = Catalog(tmp_path)
+    async def broken(catalog, item):
+        raise RuntimeError("boom\nsecond line")
+    monkeypatch.setattr("app.jobs.make_thumbnail", broken)
+    crawler = Crawler(db, FakeNetwork(items("a")))
+    with caplog.at_level("WARNING", logger="app.jobs"):
+        async def run():
+            crawler.start(SERVER)
+            await crawler.tasks[SERVER["id"]]
+        asyncio.run(run())
+    assert crawler.state(SERVER["id"])["errors"]
+    assert any("thumbnail failed" in r.getMessage() and "boom / second line" in r.getMessage() for r in caplog.records)
 
 
 def test_process_cap_bounds_concurrent_ffmpeg(monkeypatch):

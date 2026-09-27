@@ -75,6 +75,30 @@ def thumb_name(id, fingerprint):
     return f"{id}-{fingerprint[:16]}.jpg"
 
 
+def frame_time(duration, fraction):
+    # DIDL durations are rounded (a 1.5s clip is listed as 0:00:02), so stay 1s clear of the end;
+    # seeking past the last frame makes FFmpeg produce no image.
+    return max(0, min(duration * fraction, duration - 1))
+
+
+async def extract_frame(url, at, part):
+    for position in (at, 0) if at else (0,):  # retry from the start if the seek produced no frame
+        try:
+            await run_process(os.getenv("FFMPEG", "ffmpeg"), "-nostdin", "-y", "-v", "error",
+                "-rw_timeout", "15000000", "-protocol_whitelist", "http,https,tcp,tls,crypto",
+                "-ss", str(position), "-i", url, "-frames:v", "1",
+                "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2",
+                str(part))
+        except RuntimeError:
+            if not position:
+                raise
+            part.unlink(missing_ok=True)
+            continue
+        if part.exists():
+            return
+    raise RuntimeError("動画からフレームを取得できませんでした")
+
+
 async def make_thumbnail(catalog, item):
     """Returns True when FFmpeg ran, False when the cached file was reused."""
     filename = thumb_name(item["id"], item["fingerprint"])
@@ -92,11 +116,8 @@ async def make_thumbnail(catalog, item):
                 "-rw_timeout", "15000000", "-protocol_whitelist", "http,https,tcp,tls,crypto",
                 "-show_entries", "format=duration", "-of", "json", url, timeout=30)
             duration = float(json.loads(raw).get("format", {}).get("duration", 0))
-        await all_or_nothing(*(run_process(os.getenv("FFMPEG", "ffmpeg"), "-nostdin", "-y", "-v", "error",
-            "-rw_timeout", "15000000", "-protocol_whitelist", "http,https,tcp,tls,crypto",
-            "-ss", str(max(0, duration * fraction)), "-i", url, "-frames:v", "1",
-            "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2",
-            str(part)) for fraction, part in zip((0.1, 0.35, 0.65, 0.9), parts)))
+        await all_or_nothing(*(extract_frame(url, frame_time(duration, fraction), part)
+                               for fraction, part in zip((0.1, 0.35, 0.65, 0.9), parts)))
         temporary = catalog.thumbs / f"{filename}.tmp.jpg"
         args = []
         for part in parts:
@@ -152,7 +173,9 @@ class Crawler:
                     status["thumbs_skipped"] += 1
                     status["thumbs_total"] -= 1
             except Exception as error:
-                status["errors"].append(f"{item['source_title'] if item else id}: {error}")
+                message = f"{item['source_title'] if item else id}: {error}"
+                status["errors"].append(message)
+                log.warning("thumbnail failed: %s", message.strip().replace("\n", " / ")[-500:])
             finally:
                 queue.task_done()
 
@@ -197,6 +220,7 @@ class Crawler:
         except Exception as error:
             status["state"] = "failed"
             status["errors"].append(str(error))
+            log.warning("crawl failed: %s: %s", device.get("name"), error)
         finally:
             for worker in workers:
                 worker.cancel()
