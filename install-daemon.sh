@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # launch.sh をログイン時に自動起動する LaunchAgent（launchd）として登録・管理する。
-# 起動は bin/FamilyVideos（launch.sh を呼ぶだけ）経由。システム設定のバックグラウンド項目にはこの名前で表示される。
+# 起動は FamilyVideos.app（launcher/ からビルドし ad-hoc 署名する起動用アプリ）経由。launch.sh とその子プロセス（uv・python）は
+# このアプリの責任で動くので、ローカルネットワークの許可とバックグラウンド項目は「FamilyVideos」として表示される。
 set -euo pipefail
 
 usage() {
@@ -19,7 +20,7 @@ usage() {
              保存先が空で ./data にデータがあればコピーして引き継ぎます
     -y       質問せず既定値で登録（管理者トークンは環境変数 DLNA_ADMIN_TOKEN が必要）
     -dry-run 登録せず、生成する設定（トークンは伏せ字）を表示
-  uninstall  停止して登録と設定ファイルを削除（データは残します）
+  uninstall  停止して登録・設定ファイル・起動用アプリを削除（データは残します）
   status     実行状態を表示
   restart    再起動（コード更新後など）
   logs       ログを追跡表示
@@ -31,6 +32,9 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/Library/Logs/webvideo.log"
 DOMAIN="gui/$(id -u)"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+# 起動用アプリはリポジトリの外に置く（チェックアウトを移動・作り直しても同じアプリのままで、許可を保てる）
+APP="$HOME/Library/Application Support/FamilyVideos/FamilyVideos.app"
+LAUNCHER="$APP/Contents/MacOS/FamilyVideos"
 
 loaded() { launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; }
 
@@ -41,6 +45,7 @@ case "$command" in
   uninstall)
     loaded && launchctl bootout "$DOMAIN/$LABEL" || true
     rm -f "$PLIST"
+    rm -rf "$APP"
     echo "登録を解除しました（データとログは残しています）"; exit 0 ;;
   status)
     loaded || { echo "未登録です"; exit 1; }
@@ -145,7 +150,7 @@ fi
 # plistlib で書き出す（XMLエスケープのため）。トークンは引数でなく環境変数で渡し ps に出さない
 write_plist() {
   (umask 077
-   PL_OUT="$1" PL_LABEL="$LABEL" PL_ROOT="$ROOT" PL_PATH="$path_dirs" PL_DATA="$data" PL_LOG="$LOG" \
+   PL_OUT="$1" PL_LABEL="$LABEL" PL_ROOT="$ROOT" PL_LAUNCHER="$LAUNCHER" PL_PATH="$path_dirs" PL_DATA="$data" PL_LOG="$LOG" \
    PL_ADMIN="$2" PL_GUEST="$3" python3 - "${args[@]}" <<'EOF'
 import os, plistlib, sys
 e = os.environ
@@ -153,7 +158,7 @@ env = {"PATH": e["PL_PATH"], "DLNA_DATA": e["PL_DATA"], "DLNA_ADMIN_TOKEN": e["P
 if e["PL_GUEST"]:
     env["DLNA_GUEST_TOKEN"] = e["PL_GUEST"]
 with open(e["PL_OUT"], "wb") as f:
-    plistlib.dump({"Label": e["PL_LABEL"], "ProgramArguments": [e["PL_ROOT"] + "/bin/FamilyVideos", *sys.argv[1:]],
+    plistlib.dump({"Label": e["PL_LABEL"], "ProgramArguments": [e["PL_LAUNCHER"], e["PL_ROOT"] + "/launch.sh", *sys.argv[1:]],
                    "WorkingDirectory": e["PL_ROOT"], "EnvironmentVariables": env,
                    "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 30,
                    "StandardOutPath": e["PL_LOG"], "StandardErrorPath": e["PL_LOG"]}, f)
@@ -205,6 +210,8 @@ if loaded; then
     exit 1
   fi
 fi
+# ソースが前回と同じなら作り直さない（署名が変わるとローカルネットワークの許可を求め直されるため）
+"$ROOT/launcher/build.sh" "$APP"
 write_plist "$PLIST" "$admin" "$guest"
 if ! launchctl bootstrap "$DOMAIN" "$PLIST"; then
   echo "launchd への登録に失敗しました。./install-daemon.sh uninstall を実行してから再度登録してください" >&2
@@ -216,5 +223,6 @@ $generated && echo "  管理者トークン（ログインに使います。控�
 echo "  設定: ${PLIST}（本人のみ読み書き可）"
 echo "  データ: $data"
 echo "  ログ: $LOG"
-echo "初回はローカルネットワークへのアクセス許可を求められることがあります。「許可」を選んでください。"
+echo "初回は「FamilyVideos」がローカルネットワークへのアクセス許可を求めます。「許可」を選んでください。"
+echo "  （後から変更: システム設定 → プライバシーとセキュリティ → ローカルネットワーク）"
 echo "状態確認: ./install-daemon.sh status / 停止・解除: ./install-daemon.sh uninstall"
