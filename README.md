@@ -113,7 +113,7 @@ SSDPの送信インターフェースを固定する場合は `DLNA_INTERFACE` �
 ## 常駐させる（LaunchAgent）
 
 `install-daemon.sh` で `launch.sh` をLaunchAgentとして登録すると、ログイン時に自動起動し、異常終了時も再起動します。
-「システム設定 → 一般 → ログイン項目と機能拡張」のバックグラウンド項目には `FamilyVideos`（`bin/FamilyVideos`、`launch.sh` を呼ぶだけの入口）と表示されます。
+起動は `FamilyVideos.app`（`launcher/` の小さな起動用アプリ。登録時に `~/Library/Application Support/FamilyVideos/` へビルドし、この Mac 用に ad-hoc 署名します）経由です。`launch.sh` と、その子プロセスの uv・python はこのアプリの責任で動くため、バックグラウンド項目とローカルネットワークの許可は「FamilyVideos」として表示されます（uv への許可は不要です）。ビルドに Xcode Command Line Tools（`clang`）が必要です。
 ホスト名・許可する接続元・ポート・データの保存先・トークンを対話で聞き（Enterで既定値）、内容を確認してから登録します。
 トークンは本人のみ読める設定ファイル（`~/Library/LaunchAgents/local.webvideo.plist`）に保存します。管理者トークンを空欄にすると自動生成して表示します。
 
@@ -125,7 +125,7 @@ SSDPの送信インターフェースを固定する場合は `DLNA_INTERFACE` �
 
 - データの保存先は既定で `~/Library/Application Support/webvideo`（`-data`で変更）。空なら `./data` をコピーして引き継ぎます。
 - `./install-daemon.sh status` / `restart`（コード更新後）/ `logs` / `uninstall`。`-dry-run` で登録せずに設定を確認できます。
-- 初回はローカルネットワークへのアクセス許可を求められることがあります。許可しないと機器検索やNASへの接続が失敗します。
+- 初回は「FamilyVideos」がローカルネットワークへのアクセス許可を求めます。許可しないと機器検索・NAS・テレビへの接続が `No route to host` で失敗します（システム設定 → プライバシーとセキュリティ → ローカルネットワーク で変更できます）。起動用アプリのソースを変えない限り、再登録しても許可は保たれます。
 - ログインしている間だけ動きます。画面なしで運用するMacでは自動ログインを有効にしてください。
 - 手動で起動したサーバーが同じポートを使っていると登録できません。先に止めてください。
 - 起動中にLAN IPが変わった場合は `restart` してください（ルーターでIPを固定しておくのがおすすめです）。
