@@ -1,4 +1,4 @@
-# Family Videos — dlnautil for Mac
+# nas-video-browser — Family Videos for Mac
 
 MiniDLNAなどのMediaServerを選び、動画をクロールしてSQLiteへ保存し、年 → アルバム → 動画で閲覧するPythonアプリ。
 動画原本の移動・変更は行いません。MediaServerのHTTP動画URLからプレビューを作ります。
